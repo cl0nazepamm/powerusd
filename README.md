@@ -47,7 +47,7 @@ cargo build --release
 
 - **SPACE** - Toggle asset library
 - **Left Mouse** - Orbit camera
-- **Right Mouse** - Pan camera
+- **Middle Mouse** - Pan camera
 - **Scroll** - Zoom
 - **Drag & Drop** - Load USD file
 
