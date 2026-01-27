@@ -2,13 +2,12 @@
 //!
 //! This application demonstrates a more complete USD viewing experience using egui.
 
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::thread;
 use std::{env, fs};
 
-use arboard::Clipboard;
+mod ui;
+use ui::asset_library::AssetLibrary;
+use ui::theme::configure_theme;
 
 use anyhow::{bail, Result};
 use image::GenericImageView;
@@ -313,6 +312,8 @@ struct UsdMesh {
     name: String,
     positions: Vec<f32>,
     normals: Option<Vec<f32>>,
+    uvs: Option<Vec<f32>>,
+    uv_indices: Option<Vec<i32>>,
     indices: Option<Vec<u32>>,
     material: Option<UsdPreviewSurface>,
     /// World transform accumulated from ancestors.
@@ -332,345 +333,6 @@ struct HierarchyNode {
 struct InspectorCache {
     path: Option<sdf::Path>,
     fields: Vec<(String, String)>,
-}
-
-/// Asset entry in the library browser.
-#[derive(Debug, Clone)]
-struct AssetEntry {
-    path: PathBuf,
-    name: String,
-    is_dir: bool,
-    /// Optional thumbnail image path (user-provided .jpg/.png with same name).
-    thumbnail: Option<PathBuf>,
-}
-
-/// Thumbnail texture cache entry.
-struct ThumbnailTexture {
-    texture_id: egui::TextureId,
-    #[allow(dead_code)]
-    size: [f32; 2],
-}
-
-/// Thumbnail cache for loaded images.
-#[derive(Default)]
-struct ThumbnailCache {
-    /// Map from file path to loaded texture.
-    textures: HashMap<PathBuf, ThumbnailTexture>,
-    /// Paths that failed to load (don't retry).
-    failed: HashSet<PathBuf>,
-}
-
-impl ThumbnailCache {
-    /// Load a thumbnail image and register it with egui.
-    fn load_thumbnail(&mut self, ctx: &egui::Context, path: &Path) -> Option<&ThumbnailTexture> {
-        // Already loaded?
-        if self.textures.contains_key(path) {
-            return self.textures.get(path);
-        }
-
-        // Already failed?
-        if self.failed.contains(path) {
-            return None;
-        }
-
-        // Try to load the image
-        match image::open(path) {
-            Ok(img) => {
-                // Resize to thumbnail size for performance
-                let img = img.thumbnail(128, 128);
-                let size = [img.width() as f32, img.height() as f32];
-                let rgba = img.to_rgba8();
-                let pixels: Vec<egui::Color32> = rgba
-                    .pixels()
-                    .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
-                    .collect();
-
-                let image_size = [img.width() as usize, img.height() as usize];
-                let color_image = egui::ColorImage {
-                    size: image_size,
-                    pixels,
-                    source_size: egui::Vec2::new(img.width() as f32, img.height() as f32),
-                };
-
-                let texture_id = ctx.load_texture(
-                    path.to_string_lossy(),
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                );
-
-                self.textures.insert(
-                    path.to_path_buf(),
-                    ThumbnailTexture {
-                        texture_id: texture_id.id(),
-                        size,
-                    },
-                );
-                self.textures.get(path)
-            }
-            Err(_) => {
-                self.failed.insert(path.to_path_buf());
-                None
-            }
-        }
-    }
-}
-
-/// View mode for asset library.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum AssetViewMode {
-    #[default]
-    Grid,
-    List,
-}
-
-/// Render an interactive grid card with hover/selection feedback.
-fn asset_card(
-    ui: &mut egui::Ui,
-    id: egui::Id,
-    card_size: egui::Vec2,
-    _thumb_size: f32,
-    content: impl FnOnce(&mut egui::Ui),
-) -> egui::Response {
-    let (rect, _) = ui.allocate_exact_size(card_size, egui::Sense::hover());
-
-    // Render content first (non-interactive)
-    if ui.is_rect_visible(rect) {
-        let content_rect = rect.shrink(4.0);
-        let mut content_ui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
-        content_ui.set_clip_rect(content_rect);
-        content(&mut content_ui);
-    }
-
-    // Create an interactive overlay on top that captures all clicks
-    let response = ui.interact(rect, id, egui::Sense::click());
-
-    // Draw hover/selection background
-    if ui.is_rect_visible(rect) {
-        let visuals = ui.style().interact_selectable(&response, false);
-        let bg_color = if response.hovered() {
-            egui::Color32::from_rgba_unmultiplied(100, 100, 100, 40)
-        } else {
-            egui::Color32::TRANSPARENT
-        };
-
-        ui.painter().rect(
-            rect,
-            visuals.corner_radius,
-            bg_color,
-            if response.hovered() {
-                egui::Stroke::new(1.0, egui::Color32::from_gray(150))
-            } else {
-                egui::Stroke::NONE
-            },
-            egui::StrokeKind::Inside,
-        );
-    }
-
-    response
-}
-
-/// Asset library browser state.
-struct AssetLibrary {
-    /// Whether the library panel is visible.
-    visible: bool,
-    /// Animation progress for sliding (0.0 = hidden, 1.0 = fully visible).
-    anim_progress: f32,
-    /// Search query.
-    search_query: String,
-    /// Library root paths (user-configurable).
-    library_paths: Vec<PathBuf>,
-    /// Current browsing directory.
-    current_dir: Option<PathBuf>,
-    /// Cached directory entries.
-    entries: Vec<AssetEntry>,
-    /// Filtered entries (based on search).
-    filtered: Vec<AssetEntry>,
-    /// Background scanner channel.
-    scan_receiver: Option<mpsc::Receiver<Vec<AssetEntry>>>,
-    /// Path being edited for adding new library.
-    new_path_input: String,
-    /// Show path input field.
-    show_add_path: bool,
-    /// Thumbnail texture cache.
-    thumbnail_cache: ThumbnailCache,
-    /// Current view mode (grid or list).
-    view_mode: AssetViewMode,
-}
-
-impl Default for AssetLibrary {
-    fn default() -> Self {
-        Self {
-            visible: false,
-            anim_progress: 0.0,
-            search_query: String::new(),
-            library_paths: Vec::new(),
-            current_dir: None,
-            entries: Vec::new(),
-            filtered: Vec::new(),
-            scan_receiver: None,
-            new_path_input: String::new(),
-            show_add_path: false,
-            thumbnail_cache: ThumbnailCache::default(),
-            view_mode: AssetViewMode::default(),
-        }
-    }
-}
-
-impl AssetLibrary {
-    /// Toggle visibility with spacebar.
-    fn toggle(&mut self) {
-        self.visible = !self.visible;
-    }
-
-    /// Update animation progress.
-    fn update_animation(&mut self, dt: f32) {
-        let target = if self.visible { 1.0 } else { 0.0 };
-        let speed = 8.0; // Fast animation
-        self.anim_progress += (target - self.anim_progress) * speed * dt;
-        self.anim_progress = self.anim_progress.clamp(0.0, 1.0);
-    }
-
-    /// Check if panel should be rendered.
-    fn should_render(&self) -> bool {
-        self.anim_progress > 0.001
-    }
-
-    /// Scan directory in background thread.
-    fn scan_directory(&mut self, dir: &Path) {
-        self.current_dir = Some(dir.to_path_buf());
-        let dir = dir.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        self.scan_receiver = Some(rx);
-
-        thread::spawn(move || {
-            let entries = scan_directory_fast(&dir);
-            let _ = tx.send(entries);
-        });
-    }
-
-    /// Poll for scan results.
-    fn poll_scan(&mut self) {
-        if let Some(ref rx) = self.scan_receiver {
-            if let Ok(entries) = rx.try_recv() {
-                self.entries = entries;
-                self.apply_filter();
-                self.scan_receiver = None;
-            }
-        }
-    }
-
-    /// Apply search filter.
-    fn apply_filter(&mut self) {
-        if self.search_query.is_empty() {
-            self.filtered = self.entries.clone();
-        } else {
-            let query = self.search_query.to_lowercase();
-            self.filtered = self
-                .entries
-                .iter()
-                .filter(|e| e.name.to_lowercase().contains(&query))
-                .cloned()
-                .collect();
-        }
-    }
-
-    /// Add a library path.
-    fn add_library_path(&mut self, path: PathBuf) {
-        if path.is_dir() && !self.library_paths.contains(&path) {
-            self.library_paths.push(path);
-        }
-    }
-
-    /// Remove a library path.
-    fn remove_library_path(&mut self, index: usize) {
-        if index < self.library_paths.len() {
-            self.library_paths.remove(index);
-        }
-    }
-}
-
-/// Fast directory scanning for USD assets.
-/// Find thumbnail for a file or folder.
-/// For files: look for same_name.jpg/png
-/// For folders: look for folder_name.jpg/png OR folder/cover.jpg/png
-fn find_thumbnail(path: &Path, is_dir: bool) -> Option<PathBuf> {
-    let stem = path.file_stem()?.to_str()?;
-    let parent = path.parent()?;
-
-    // Try common image extensions
-    for ext in ["jpg", "jpeg", "png", "webp"] {
-        // For both files and folders: check for name.ext next to it
-        let thumb_path = parent.join(format!("{}.{}", stem, ext));
-        if thumb_path.exists() {
-            return Some(thumb_path);
-        }
-    }
-
-    // For folders only: check for cover.ext inside
-    if is_dir {
-        for ext in ["jpg", "jpeg", "png", "webp"] {
-            let cover_path = path.join(format!("cover.{}", ext));
-            if cover_path.exists() {
-                return Some(cover_path);
-            }
-        }
-    }
-
-    None
-}
-
-/// Fast directory scanning for USD assets with thumbnail detection.
-fn scan_directory_fast(dir: &Path) -> Vec<AssetEntry> {
-    let Ok(read_dir) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-
-    let mut entries: Vec<AssetEntry> = read_dir
-        .filter_map(|e| e.ok())
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            // Skip hidden files
-            if name.starts_with('.') {
-                return None;
-            }
-
-            let is_dir = path.is_dir();
-            if is_dir {
-                let thumbnail = find_thumbnail(&path, true);
-                return Some(AssetEntry {
-                    path,
-                    name,
-                    is_dir,
-                    thumbnail,
-                });
-            }
-
-            // Filter for USD file types
-            let ext = path.extension()?.to_str()?.to_lowercase();
-            if matches!(ext.as_str(), "usd" | "usda" | "usdc" | "usdz") {
-                let thumbnail = find_thumbnail(&path, false);
-                Some(AssetEntry {
-                    path,
-                    name,
-                    is_dir,
-                    thumbnail,
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // Sort: directories first, then alphabetically
-    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
-
-    entries
 }
 
 /// Scene state that can be reloaded.
@@ -1010,6 +672,21 @@ fn try_extract_mesh(
     }
 
     let normals = get_property(data, path, "normals").and_then(|v| v.try_as_vec_3f());
+
+    // Try to get UVs from common primvar names
+    let uvs = get_property(data, path, "primvars:st")
+        .or_else(|| get_property(data, path, "primvars:st0"))
+        .or_else(|| get_property(data, path, "primvars:uv"))
+        .or_else(|| get_property(data, path, "primvars:UVMap"))
+        .and_then(|v| v.try_as_vec_2f());
+
+    // Get UV indices for faceVarying interpolation
+    let uv_indices = get_property(data, path, "primvars:st:indices")
+        .or_else(|| get_property(data, path, "primvars:st0:indices"))
+        .or_else(|| get_property(data, path, "primvars:uv:indices"))
+        .or_else(|| get_property(data, path, "primvars:UVMap:indices"))
+        .and_then(|v| v.try_as_int_vec());
+
     let face_vertex_counts =
         get_property(data, path, "faceVertexCounts").and_then(|v| v.try_as_int_vec());
     let face_vertex_indices =
@@ -1028,6 +705,8 @@ fn try_extract_mesh(
         name: name.to_string(),
         positions,
         normals,
+        uvs,
+        uv_indices,
         indices,
         material,
         world_transform,
@@ -1305,6 +984,41 @@ fn create_scene(
                 cpu_mesh.normals = Some(normals);
             } else {
                 cpu_mesh.compute_normals();
+            }
+
+            // Add UVs if available
+            if let Some(ref uv_data) = mesh.uvs {
+                let vertex_count = mesh.positions.len() / 3;
+                let uv_count = uv_data.len() / 2;
+
+                // Check if UVs match vertex count (vertex interpolation)
+                if uv_count == vertex_count {
+                    let uvs: Vec<Vec2> = uv_data
+                        .chunks(2)
+                        .map(|c| vec2(c[0], 1.0 - c[1])) // Flip V for OpenGL convention
+                        .collect();
+                    cpu_mesh.uvs = Some(uvs);
+                } else if let Some(ref uv_idx) = mesh.uv_indices {
+                    // FaceVarying UVs with indices - expand to match indexed vertices
+                    // The UV indices reference into the UV array, and should align with face vertex indices
+                    if let Some(ref mesh_indices) = mesh.indices {
+                        // Create per-vertex UVs by mapping through indices
+                        let mut vertex_uvs = vec![vec2(0.0, 0.0); vertex_count];
+                        for (face_vert_idx, &uv_idx_val) in uv_idx.iter().enumerate() {
+                            if face_vert_idx < mesh_indices.len() {
+                                let vertex_idx = mesh_indices[face_vert_idx] as usize;
+                                let uv_idx_usize = uv_idx_val as usize;
+                                if vertex_idx < vertex_count && uv_idx_usize * 2 + 1 < uv_data.len()
+                                {
+                                    let u = uv_data[uv_idx_usize * 2];
+                                    let v = 1.0 - uv_data[uv_idx_usize * 2 + 1];
+                                    vertex_uvs[vertex_idx] = vec2(u, v);
+                                }
+                            }
+                        }
+                        cpu_mesh.uvs = Some(vertex_uvs);
+                    }
+                }
             }
 
             let cpu_material = if let Some(ref usd_mat) = mesh.material {
@@ -1586,6 +1300,7 @@ fn main() {
 
     // Track previous selection to detect changes
     let mut prev_selected: Option<sdf::Path> = None;
+    let mut first_frame = true;
 
     event_loop.run(move |event, _, control_flow| {
         match event {
@@ -1606,7 +1321,9 @@ fn main() {
 
                 // Update inspector cache only when selection changes
                 if state.selected_path != prev_selected {
-                    if let (Some(ref path), Some(ref mut stage)) = (&state.selected_path, &mut state.stage) {
+                    if let (Some(ref path), Some(ref mut stage)) =
+                        (&state.selected_path, &mut state.stage)
+                    {
                         state.inspector_cache = update_inspector_cache(stage.as_mut(), path);
                     } else {
                         state.inspector_cache = InspectorCache::default();
@@ -1622,8 +1339,13 @@ fn main() {
                     frame_input.viewport,
                     frame_input.device_pixel_ratio,
                     |gui_context| {
+                        if first_frame {
+                            configure_theme(gui_context);
+                            first_frame = false;
+                        }
                         // Toggle asset library with spacebar (only when no text input is focused)
-                        if !gui_context.wants_keyboard_input() && gui_context.input(|i| i.key_pressed(egui::Key::Space))
+                        if !gui_context.wants_keyboard_input()
+                            && gui_context.input(|i| i.key_pressed(egui::Key::Space))
                         {
                             state.asset_library.toggle();
                         }
@@ -1636,7 +1358,11 @@ fn main() {
                                 ui.heading("Stage Hierarchy");
                                 if let Some(ref hierarchy) = state.hierarchy_cache {
                                     egui::ScrollArea::vertical().show(ui, |ui| {
-                                        show_hierarchy_cached(ui, hierarchy, &mut state.selected_path);
+                                        show_hierarchy_cached(
+                                            ui,
+                                            hierarchy,
+                                            &mut state.selected_path,
+                                        );
                                     });
                                 } else {
                                     ui.label("No file loaded. Drag & drop a USD file.");
@@ -1666,7 +1392,11 @@ fn main() {
                                     let camera_distance = state.scene.size * 2.0;
                                     camera.set_view(
                                         state.scene.center
-                                            + vec3(camera_distance, camera_distance * 0.5, camera_distance),
+                                            + vec3(
+                                                camera_distance,
+                                                camera_distance * 0.5,
+                                                camera_distance,
+                                            ),
                                         state.scene.center,
                                         vec3(0.0, 1.0, 0.0),
                                     );
@@ -1679,7 +1409,10 @@ fn main() {
 
                                 ui.separator();
 
-                                if ui.checkbox(&mut state.show_textures, "Show Textures").clicked() {
+                                if ui
+                                    .checkbox(&mut state.show_textures, "Show Textures")
+                                    .clicked()
+                                {
                                     // Rebuild scene when toggle changes
                                     state.scene = create_scene(
                                         &context,
@@ -1701,349 +1434,8 @@ fn main() {
                             egui::TopBottomPanel::bottom("asset_library")
                                 .exact_height(panel_height)
                                 .show(gui_context, |ui| {
-                                    // Header bar
-                                    ui.horizontal(|ui| {
-                                        ui.heading("Asset Library");
-                                        ui.separator();
-
-                                        // Search box
-                                        let search_resp = ui.add(
-                                            egui::TextEdit::singleline(&mut state.asset_library.search_query)
-                                                .hint_text("Search assets...")
-                                                .desired_width(200.0),
-                                        );
-                                        if search_resp.changed() {
-                                            state.asset_library.apply_filter();
-                                        }
-
-                                        ui.separator();
-
-                                        // Back button
-                                        if state.asset_library.current_dir.is_some() && ui.button("< Back").clicked() {
-                                            if let Some(ref dir) = state.asset_library.current_dir.clone() {
-                                                if let Some(parent) = dir.parent() {
-                                                    // Check if current dir is one of library roots
-                                                    let is_root =
-                                                        state.asset_library.library_paths.iter().any(|p| p == dir);
-                                                    if is_root {
-                                                        state.asset_library.current_dir = None;
-                                                        state.asset_library.entries.clear();
-                                                        state.asset_library.filtered.clear();
-                                                    } else {
-                                                        state.asset_library.scan_directory(parent);
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            if ui.button("+ Add Path").clicked() {
-                                                state.asset_library.show_add_path = !state.asset_library.show_add_path;
-                                            }
-                                            ui.separator();
-                                            // View mode toggle
-                                            if ui
-                                                .selectable_label(
-                                                    state.asset_library.view_mode == AssetViewMode::Grid,
-                                                    "Grid",
-                                                )
-                                                .clicked()
-                                            {
-                                                state.asset_library.view_mode = AssetViewMode::Grid;
-                                            }
-                                            if ui
-                                                .selectable_label(
-                                                    state.asset_library.view_mode == AssetViewMode::List,
-                                                    "List",
-                                                )
-                                                .clicked()
-                                            {
-                                                state.asset_library.view_mode = AssetViewMode::List;
-                                            }
-                                        });
-                                    });
-
-                                    // Path input row (shown when adding new path)
-                                    if state.asset_library.show_add_path {
-                                        ui.horizontal(|ui| {
-                                            ui.label("Path:");
-                                            let text_edit = ui.add(
-                                                egui::TextEdit::singleline(&mut state.asset_library.new_path_input)
-                                                    .desired_width(400.0)
-                                                    .hint_text("Enter path or right-click to paste..."),
-                                            );
-
-                                            // Handle Ctrl+V paste
-                                            if text_edit.has_focus()
-                                                && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::V))
-                                            {
-                                                if let Ok(mut clipboard) = Clipboard::new() {
-                                                    if let Ok(text) = clipboard.get_text() {
-                                                        state.asset_library.new_path_input.push_str(&text);
-                                                    }
-                                                }
-                                            }
-
-                                            // Right-click context menu for paste
-                                            text_edit.context_menu(|ui| {
-                                                if ui.button("Paste").clicked() {
-                                                    if let Ok(mut clipboard) = Clipboard::new() {
-                                                        if let Ok(text) = clipboard.get_text() {
-                                                            state.asset_library.new_path_input.push_str(&text);
-                                                        }
-                                                    }
-                                                    ui.close();
-                                                }
-                                                if ui.button("Clear").clicked() {
-                                                    state.asset_library.new_path_input.clear();
-                                                    ui.close();
-                                                }
-                                            });
-
-                                            if ui.button("Add").clicked() {
-                                                let path = PathBuf::from(&state.asset_library.new_path_input);
-                                                state.asset_library.add_library_path(path);
-                                                state.asset_library.new_path_input.clear();
-                                                state.asset_library.show_add_path = false;
-                                            }
-                                            if ui.button("Cancel").clicked() {
-                                                state.asset_library.new_path_input.clear();
-                                                state.asset_library.show_add_path = false;
-                                            }
-                                        });
-                                    }
-
-                                    ui.separator();
-
-                                    // Main content area
-                                    let mut dir_to_scan: Option<PathBuf> = None;
-                                    let mut path_to_remove: Option<usize> = None;
-                                    let mut clear_search = false;
-
-                                    let view_mode = state.asset_library.view_mode;
-                                    let thumb_size = 80.0;
-                                    let card_size = egui::vec2(thumb_size + 8.0, thumb_size + 24.0);
-
-                                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                                        if state.asset_library.current_dir.is_none() {
-                                            // Show library roots
-                                            if state.asset_library.library_paths.is_empty() {
-                                                ui.vertical_centered(|ui| {
-                                                    ui.add_space(40.0);
-                                                    ui.label("No library paths configured.");
-                                                    ui.label("Click '+ Add Path' to add asset directories.");
-                                                });
-                                            } else {
-                                                // Clone paths to avoid borrow conflict
-                                                let paths: Vec<_> = state
-                                                    .asset_library
-                                                    .library_paths
-                                                    .iter()
-                                                    .enumerate()
-                                                    .map(|(i, p)| (i, p.clone()))
-                                                    .collect();
-
-                                                match view_mode {
-                                                    AssetViewMode::List => {
-                                                        for (idx, path) in paths {
-                                                            let name = path
-                                                                .file_name()
-                                                                .map(|n| n.to_string_lossy().to_string())
-                                                                .unwrap_or_else(|| path.to_string_lossy().to_string());
-
-                                                            let resp =
-                                                                ui.selectable_label(false, format!("📁 {}", name));
-                                                            if resp.clicked() {
-                                                                dir_to_scan = Some(path.clone());
-                                                            }
-                                                            resp.context_menu(|ui| {
-                                                                if ui.button("Remove").clicked() {
-                                                                    path_to_remove = Some(idx);
-                                                                    ui.close();
-                                                                }
-                                                            });
-                                                        }
-                                                    }
-                                                    AssetViewMode::Grid => {
-                                                        let available_width = ui.available_width();
-                                                        let cols =
-                                                            ((available_width / card_size.x).floor() as usize).max(1);
-
-                                                        ui.horizontal_wrapped(|ui| {
-                                                            for (idx, path) in paths.iter() {
-                                                                let name = path
-                                                                    .file_name()
-                                                                    .map(|n| n.to_string_lossy().to_string())
-                                                                    .unwrap_or_else(|| {
-                                                                        path.to_string_lossy().to_string()
-                                                                    });
-
-                                                                let thumb = find_thumbnail(path, true);
-                                                                let card_id =
-                                                                    egui::Id::new(("lib_root", path.as_path()));
-
-                                                                let resp = asset_card(
-                                                                    ui,
-                                                                    card_id,
-                                                                    card_size,
-                                                                    thumb_size,
-                                                                    |ui| {
-                                                                        ui.vertical_centered(|ui| {
-                                                                            if let Some(ref thumb_path) = thumb {
-                                                                                if let Some(tex) = state
-                                                                                    .asset_library
-                                                                                    .thumbnail_cache
-                                                                                    .load_thumbnail(
-                                                                                        gui_context,
-                                                                                        thumb_path,
-                                                                                    )
-                                                                                {
-                                                                                    ui.image(
-                                                                                        egui::load::SizedTexture::new(
-                                                                                            tex.texture_id,
-                                                                                            [thumb_size, thumb_size],
-                                                                                        ),
-                                                                                    );
-                                                                                } else {
-                                                                                    ui.add_sized(
-                                                                                        [thumb_size, thumb_size],
-                                                                                        egui::Label::new("📁"),
-                                                                                    );
-                                                                                }
-                                                                            } else {
-                                                                                ui.add_sized(
-                                                                                    [thumb_size, thumb_size],
-                                                                                    egui::Label::new("📁"),
-                                                                                );
-                                                                            }
-                                                                            let short_name: String =
-                                                                                name.chars().take(12).collect();
-                                                                            ui.label(&short_name);
-                                                                        });
-                                                                    },
-                                                                );
-
-                                                                if resp.clicked() {
-                                                                    dir_to_scan = Some(path.clone());
-                                                                }
-                                                                resp.context_menu(|ui| {
-                                                                    if ui.button("Remove").clicked() {
-                                                                        path_to_remove = Some(*idx);
-                                                                        ui.close();
-                                                                    }
-                                                                });
-                                                            }
-                                                        });
-                                                        let _ = cols; // suppress unused warning
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            // Show directory contents
-                                            if state.asset_library.filtered.is_empty() {
-                                                ui.label("No USD assets found.");
-                                            } else {
-                                                let entries = state.asset_library.filtered.to_vec();
-
-                                                match view_mode {
-                                                    AssetViewMode::List => {
-                                                        for entry in entries {
-                                                            let icon = if entry.is_dir { "📁" } else { "📄" };
-                                                            let resp = ui.selectable_label(
-                                                                false,
-                                                                format!("{} {}", icon, entry.name),
-                                                            );
-                                                            if resp.clicked() {
-                                                                if entry.is_dir {
-                                                                    dir_to_scan = Some(entry.path.clone());
-                                                                    clear_search = true;
-                                                                } else {
-                                                                    file_to_load = Some(entry.path.clone());
-                                                                }
-                                                            }
-                                                            if resp.double_clicked() && !entry.is_dir {
-                                                                file_to_load = Some(entry.path.clone());
-                                                            }
-                                                        }
-                                                    }
-                                                    AssetViewMode::Grid => {
-                                                        ui.horizontal_wrapped(|ui| {
-                                                            for entry in entries.iter() {
-                                                                let icon = if entry.is_dir { "📁" } else { "📄" };
-                                                                let card_id =
-                                                                    egui::Id::new(("asset", entry.path.as_path()));
-
-                                                                let resp = asset_card(
-                                                                    ui,
-                                                                    card_id,
-                                                                    card_size,
-                                                                    thumb_size,
-                                                                    |ui| {
-                                                                        ui.vertical_centered(|ui| {
-                                                                            if let Some(ref thumb_path) =
-                                                                                entry.thumbnail
-                                                                            {
-                                                                                if let Some(tex) = state
-                                                                                    .asset_library
-                                                                                    .thumbnail_cache
-                                                                                    .load_thumbnail(
-                                                                                        gui_context,
-                                                                                        thumb_path,
-                                                                                    )
-                                                                                {
-                                                                                    ui.image(
-                                                                                        egui::load::SizedTexture::new(
-                                                                                            tex.texture_id,
-                                                                                            [thumb_size, thumb_size],
-                                                                                        ),
-                                                                                    );
-                                                                                } else {
-                                                                                    ui.add_sized(
-                                                                                        [thumb_size, thumb_size],
-                                                                                        egui::Label::new(icon),
-                                                                                    );
-                                                                                }
-                                                                            } else {
-                                                                                ui.add_sized(
-                                                                                    [thumb_size, thumb_size],
-                                                                                    egui::Label::new(icon),
-                                                                                );
-                                                                            }
-                                                                            let short_name: String =
-                                                                                entry.name.chars().take(12).collect();
-                                                                            ui.label(&short_name);
-                                                                        });
-                                                                    },
-                                                                );
-
-                                                                if resp.clicked() {
-                                                                    if entry.is_dir {
-                                                                        dir_to_scan = Some(entry.path.clone());
-                                                                        clear_search = true;
-                                                                    } else {
-                                                                        file_to_load = Some(entry.path.clone());
-                                                                    }
-                                                                }
-                                                                if resp.double_clicked() && !entry.is_dir {
-                                                                    file_to_load = Some(entry.path.clone());
-                                                                }
-                                                            }
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    });
-
-                                    // Apply deferred actions
-                                    if let Some(path) = dir_to_scan {
-                                        state.asset_library.scan_directory(&path);
-                                    }
-                                    if clear_search {
-                                        state.asset_library.search_query.clear();
-                                    }
-                                    if let Some(idx) = path_to_remove {
-                                        state.asset_library.remove_library_path(idx);
+                                    if let Some(path) = state.asset_library.show(gui_context, ui) {
+                                        file_to_load = Some(path);
                                     }
                                 });
                         }
@@ -2084,6 +1476,28 @@ fn main() {
                 };
                 camera.set_viewport(render_viewport);
                 control.handle_events(&mut camera, &mut frame_input.events);
+
+                // Handle middle mouse button panning
+                for event in frame_input.events.iter_mut() {
+                    if let renderer::control::Event::MouseMotion {
+                        delta,
+                        button: Some(MouseButton::Middle),
+                        handled,
+                        ..
+                    } = event
+                    {
+                        if !*handled {
+                            let distance = control.target.distance(camera.position());
+                            let speed = 0.001 * distance;
+                            let right = camera.right_direction();
+                            let up = right.cross(camera.view_direction());
+                            let pan = -right * delta.0 * speed + up * delta.1 * speed;
+                            camera.translate(pan);
+                            control.target += pan;
+                            *handled = true;
+                        }
+                    }
+                }
 
                 let screen = frame_input.screen();
                 screen.clear(ClearState::color_and_depth(0.15, 0.15, 0.18, 1.0, 1.0));
