@@ -83,27 +83,42 @@ impl Default for UsdPreviewSurface {
 
 // ... existing code ...
 
-fn get_shader_texture_path(data: &mut dyn AbstractData, shader_path: &sdf::Path, input: &str) -> Option<String> {
-    let input_path = shader_path.append_property(&format!("inputs:{}", input)).ok()?;
+fn get_shader_texture_path(
+    data: &mut dyn AbstractData,
+    shader_path: &sdf::Path,
+    input: &str,
+) -> Option<String> {
+    let input_path = shader_path
+        .append_property(&format!("inputs:{}", input))
+        .ok()?;
 
     // Check connections
     if let Ok(val) = data.get(&input_path, "connectionPaths") {
         if let Some(list_op) = val.into_owned().try_as_path_list_op() {
-            if let Some(conn_path) = list_op.explicit_items.first().or(list_op.prepended_items.first()) {
+            if let Some(conn_path) = list_op
+                .explicit_items
+                .first()
+                .or(list_op.prepended_items.first())
+            {
                 // Follow connection to texture shader
                 let conn_str = conn_path.as_str();
                 if let Some(dot_pos) = conn_str.rfind('.') {
                     let texture_prim_path = &conn_str[..dot_pos];
                     if let Ok(texture_path) = sdf::path(texture_prim_path) {
                         // Check if it is a UsdUVTexture
-                        if let Ok(info_id) = data.get(&texture_path.append_property("info:id").ok()?, "default") {
+                        if let Ok(info_id) =
+                            data.get(&texture_path.append_property("info:id").ok()?, "default")
+                        {
                             if let Some(id) = info_id.into_owned().try_as_token() {
                                 if id == "UsdUVTexture" {
                                     // Get inputs:file
-                                    if let Ok(file_val) =
-                                        data.get(&texture_path.append_property("inputs:file").ok()?, "default")
-                                    {
-                                        if let Some(asset_path) = file_val.into_owned().try_as_asset_path() {
+                                    if let Ok(file_val) = data.get(
+                                        &texture_path.append_property("inputs:file").ok()?,
+                                        "default",
+                                    ) {
+                                        if let Some(asset_path) =
+                                            file_val.into_owned().try_as_asset_path()
+                                        {
                                             return Some(asset_path.to_string());
                                         }
                                     }
@@ -119,7 +134,10 @@ fn get_shader_texture_path(data: &mut dyn AbstractData, shader_path: &sdf::Path,
 }
 
 /// Extract UsdPreviewSurface properties from a shader prim.
-fn extract_preview_surface(data: &mut dyn AbstractData, shader_path: &sdf::Path) -> UsdPreviewSurface {
+fn extract_preview_surface(
+    data: &mut dyn AbstractData,
+    shader_path: &sdf::Path,
+) -> UsdPreviewSurface {
     let mut mat = UsdPreviewSurface::default();
 
     if let Some(color) = get_shader_color3f(data, shader_path, "diffuseColor") {
@@ -146,6 +164,148 @@ fn extract_preview_surface(data: &mut dyn AbstractData, shader_path: &sdf::Path)
     mat
 }
 
+/// A 4x4 transformation matrix (column-major).
+#[derive(Debug, Clone, Copy)]
+struct Matrix4 {
+    m: [[f32; 4]; 4],
+}
+
+impl Matrix4 {
+    /// Identity matrix.
+    fn identity() -> Self {
+        Self {
+            m: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }
+    }
+
+    /// Create a translation matrix.
+    fn from_translation(x: f32, y: f32, z: f32) -> Self {
+        Self {
+            m: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [x, y, z, 1.0],
+            ],
+        }
+    }
+
+    /// Create a scale matrix.
+    fn from_scale(x: f32, y: f32, z: f32) -> Self {
+        Self {
+            m: [
+                [x, 0.0, 0.0, 0.0],
+                [0.0, y, 0.0, 0.0],
+                [0.0, 0.0, z, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }
+    }
+
+    /// Create a rotation matrix from Euler angles (XYZ order, degrees).
+    fn from_rotation_xyz(rx: f32, ry: f32, rz: f32) -> Self {
+        let rx = rx.to_radians();
+        let ry = ry.to_radians();
+        let rz = rz.to_radians();
+
+        let (sx, cx) = (rx.sin(), rx.cos());
+        let (sy, cy) = (ry.sin(), ry.cos());
+        let (sz, cz) = (rz.sin(), rz.cos());
+
+        // Combined rotation: Rz * Ry * Rx
+        Self {
+            m: [
+                [cy * cz, cy * sz, -sy, 0.0],
+                [sx * sy * cz - cx * sz, sx * sy * sz + cx * cz, sx * cy, 0.0],
+                [cx * sy * cz + sx * sz, cx * sy * sz - sx * cz, cx * cy, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }
+    }
+
+    /// Create from a full 4x4 matrix (row-major input, as USD stores it).
+    fn from_matrix4d(values: &[f64]) -> Self {
+        if values.len() < 16 {
+            return Self::identity();
+        }
+        // USD stores matrices row-major, we use column-major
+        Self {
+            m: [
+                [
+                    values[0] as f32,
+                    values[4] as f32,
+                    values[8] as f32,
+                    values[12] as f32,
+                ],
+                [
+                    values[1] as f32,
+                    values[5] as f32,
+                    values[9] as f32,
+                    values[13] as f32,
+                ],
+                [
+                    values[2] as f32,
+                    values[6] as f32,
+                    values[10] as f32,
+                    values[14] as f32,
+                ],
+                [
+                    values[3] as f32,
+                    values[7] as f32,
+                    values[11] as f32,
+                    values[15] as f32,
+                ],
+            ],
+        }
+    }
+
+    /// Multiply two matrices: self * other.
+    fn mul(&self, other: &Matrix4) -> Matrix4 {
+        let mut result = [[0.0f32; 4]; 4];
+        for (i, row) in result.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell = self.m[0][j] * other.m[i][0]
+                    + self.m[1][j] * other.m[i][1]
+                    + self.m[2][j] * other.m[i][2]
+                    + self.m[3][j] * other.m[i][3];
+            }
+        }
+        Matrix4 { m: result }
+    }
+
+    /// Transform a point (x, y, z) by this matrix.
+    fn transform_point(&self, x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+        let w = self.m[0][3] * x + self.m[1][3] * y + self.m[2][3] * z + self.m[3][3];
+        let inv_w = if w.abs() > 1e-10 { 1.0 / w } else { 1.0 };
+        (
+            (self.m[0][0] * x + self.m[1][0] * y + self.m[2][0] * z + self.m[3][0]) * inv_w,
+            (self.m[0][1] * x + self.m[1][1] * y + self.m[2][1] * z + self.m[3][1]) * inv_w,
+            (self.m[0][2] * x + self.m[1][2] * y + self.m[2][2] * z + self.m[3][2]) * inv_w,
+        )
+    }
+
+    /// Transform a normal vector (ignores translation, uses inverse transpose for proper normal transform).
+    fn transform_normal(&self, nx: f32, ny: f32, nz: f32) -> (f32, f32, f32) {
+        // For orthogonal matrices (rotation only), we can use the upper-left 3x3 directly
+        // For non-uniform scale, we'd need the inverse transpose, but this is a reasonable approximation
+        let rx = self.m[0][0] * nx + self.m[1][0] * ny + self.m[2][0] * nz;
+        let ry = self.m[0][1] * nx + self.m[1][1] * ny + self.m[2][1] * nz;
+        let rz = self.m[0][2] * nx + self.m[1][2] * ny + self.m[2][2] * nz;
+        // Normalize
+        let len = (rx * rx + ry * ry + rz * rz).sqrt();
+        if len > 1e-10 {
+            (rx / len, ry / len, rz / len)
+        } else {
+            (0.0, 1.0, 0.0)
+        }
+    }
+}
+
 /// Mesh data extracted from USD.
 struct UsdMesh {
     path: sdf::Path,
@@ -155,6 +315,8 @@ struct UsdMesh {
     normals: Option<Vec<f32>>,
     indices: Option<Vec<u32>>,
     material: Option<UsdPreviewSurface>,
+    /// World transform accumulated from ancestors.
+    world_transform: Matrix4,
 }
 
 /// Cached hierarchy node for efficient UI rendering.
@@ -230,7 +392,11 @@ impl ThumbnailCache {
                     source_size: egui::Vec2::new(img.width() as f32, img.height() as f32),
                 };
 
-                let texture_id = ctx.load_texture(path.to_string_lossy(), color_image, egui::TextureOptions::LINEAR);
+                let texture_id = ctx.load_texture(
+                    path.to_string_lossy(),
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                );
 
                 self.textures.insert(
                     path.to_path_buf(),
@@ -516,7 +682,11 @@ struct Scene {
 }
 
 /// Get a property value from a prim, handling both static and time-sampled data.
-fn get_property(data: &mut dyn AbstractData, prim_path: &sdf::Path, property: &str) -> Option<sdf::Value> {
+fn get_property(
+    data: &mut dyn AbstractData,
+    prim_path: &sdf::Path,
+    property: &str,
+) -> Option<sdf::Value> {
     // Try direct field access first
     if let Ok(val) = data.get(prim_path, property) {
         return Some(val.into_owned());
@@ -540,6 +710,104 @@ fn get_property(data: &mut dyn AbstractData, prim_path: &sdf::Path, property: &s
     }
 
     None
+}
+
+/// Get the local transform matrix for a prim.
+///
+/// Reads xformOpOrder and applies transform operations in order.
+fn get_local_transform(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> Matrix4 {
+    // Get xformOpOrder to know which ops to apply and in what order
+    let op_order = match get_property(data, prim_path, "xformOpOrder") {
+        Some(val) => val.try_as_token_vec().unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    if op_order.is_empty() {
+        return Matrix4::identity();
+    }
+
+    let mut result = Matrix4::identity();
+
+    for op_name in op_order {
+        // Parse op name: "xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale", "xformOp:transform"
+        // May have suffix like "xformOp:translate:pivot"
+        let op_type = op_name.strip_prefix("xformOp:").unwrap_or(&op_name);
+        let op_type_base = op_type.split(':').next().unwrap_or(op_type);
+
+        // Get the property value
+        let prop_name = format!("xformOp:{}", op_type);
+        let val = match get_property(data, prim_path, &prop_name) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let op_matrix = match op_type_base {
+            "translate" => {
+                if let Some(v) = val.clone().try_as_vec_3d() {
+                    if v.len() >= 3 {
+                        Matrix4::from_translation(v[0] as f32, v[1] as f32, v[2] as f32)
+                    } else {
+                        Matrix4::identity()
+                    }
+                } else if let Some(v) = val.try_as_vec_3f() {
+                    if v.len() >= 3 {
+                        Matrix4::from_translation(v[0], v[1], v[2])
+                    } else {
+                        Matrix4::identity()
+                    }
+                } else {
+                    Matrix4::identity()
+                }
+            }
+            "scale" => {
+                if let Some(v) = val.clone().try_as_vec_3d() {
+                    if v.len() >= 3 {
+                        Matrix4::from_scale(v[0] as f32, v[1] as f32, v[2] as f32)
+                    } else {
+                        Matrix4::identity()
+                    }
+                } else if let Some(v) = val.try_as_vec_3f() {
+                    if v.len() >= 3 {
+                        Matrix4::from_scale(v[0], v[1], v[2])
+                    } else {
+                        Matrix4::identity()
+                    }
+                } else {
+                    Matrix4::identity()
+                }
+            }
+            "rotateXYZ" => {
+                if let Some(v) = val.clone().try_as_vec_3d() {
+                    if v.len() >= 3 {
+                        Matrix4::from_rotation_xyz(v[0] as f32, v[1] as f32, v[2] as f32)
+                    } else {
+                        Matrix4::identity()
+                    }
+                } else if let Some(v) = val.try_as_vec_3f() {
+                    if v.len() >= 3 {
+                        Matrix4::from_rotation_xyz(v[0], v[1], v[2])
+                    } else {
+                        Matrix4::identity()
+                    }
+                } else {
+                    Matrix4::identity()
+                }
+            }
+            "transform" => {
+                // Full 4x4 matrix
+                if let Some(v) = val.try_as_matrix_4d() {
+                    Matrix4::from_matrix4d(&v)
+                } else {
+                    Matrix4::identity()
+                }
+            }
+            _ => Matrix4::identity(),
+        };
+
+        result = result.mul(&op_matrix);
+    }
+
+    result
 }
 
 /// Triangulate polygon mesh indices using fan triangulation.
@@ -606,7 +874,10 @@ fn is_preview_surface_shader(data: &mut dyn AbstractData, prim_path: &sdf::Path)
 }
 
 /// Find UsdPreviewSurface shader within a material (recursive search).
-fn find_preview_surface_shader(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> Option<sdf::Path> {
+fn find_preview_surface_shader(
+    data: &mut dyn AbstractData,
+    prim_path: &sdf::Path,
+) -> Option<sdf::Path> {
     let children = data
         .get(prim_path, "primChildren")
         .ok()?
@@ -629,8 +900,14 @@ fn find_preview_surface_shader(data: &mut dyn AbstractData, prim_path: &sdf::Pat
 }
 
 /// Extract a float value from shader input.
-fn get_shader_float(data: &mut dyn AbstractData, shader_path: &sdf::Path, input: &str) -> Option<f32> {
-    let input_path = shader_path.append_property(&format!("inputs:{}", input)).ok()?;
+fn get_shader_float(
+    data: &mut dyn AbstractData,
+    shader_path: &sdf::Path,
+    input: &str,
+) -> Option<f32> {
+    let input_path = shader_path
+        .append_property(&format!("inputs:{}", input))
+        .ok()?;
     let val = data.get(&input_path, "default").ok()?.into_owned();
     val.clone()
         .try_as_float()
@@ -638,8 +915,14 @@ fn get_shader_float(data: &mut dyn AbstractData, shader_path: &sdf::Path, input:
 }
 
 /// Extract a color3f value from shader input, following texture connections if needed.
-fn get_shader_color3f(data: &mut dyn AbstractData, shader_path: &sdf::Path, input: &str) -> Option<[f32; 3]> {
-    let input_path = shader_path.append_property(&format!("inputs:{}", input)).ok()?;
+fn get_shader_color3f(
+    data: &mut dyn AbstractData,
+    shader_path: &sdf::Path,
+    input: &str,
+) -> Option<[f32; 3]> {
+    let input_path = shader_path
+        .append_property(&format!("inputs:{}", input))
+        .ok()?;
 
     if !data.has_spec(&input_path) {
         return None;
@@ -663,7 +946,11 @@ fn get_shader_color3f(data: &mut dyn AbstractData, shader_path: &sdf::Path, inpu
     // If connected to a texture, try to get fallback from the texture node
     if let Ok(val) = data.get(&input_path, "connectionPaths") {
         if let Some(list_op) = val.into_owned().try_as_path_list_op() {
-            if let Some(conn_path) = list_op.explicit_items.first().or(list_op.prepended_items.first()) {
+            if let Some(conn_path) = list_op
+                .explicit_items
+                .first()
+                .or(list_op.prepended_items.first())
+            {
                 // Connection path is like /Material/Texture.outputs:rgb
                 // We need to get to the texture prim and check for inputs:fallback
                 let conn_str = conn_path.as_str();
@@ -696,24 +983,37 @@ fn get_shader_color3f(data: &mut dyn AbstractData, shader_path: &sdf::Path, inpu
 }
 
 /// Get material for a mesh prim.
-fn get_mesh_material(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> Option<UsdPreviewSurface> {
+fn get_mesh_material(
+    data: &mut dyn AbstractData,
+    prim_path: &sdf::Path,
+) -> Option<UsdPreviewSurface> {
     let material_path = get_material_binding(data, prim_path)?;
     let shader_path = find_preview_surface_shader(data, &material_path)?;
     Some(extract_preview_surface(data, &shader_path))
 }
 
 /// Try to extract mesh data from a single prim path.
-fn try_extract_mesh(data: &mut dyn AbstractData, path: &sdf::Path, name: &str) -> Option<UsdMesh> {
+fn try_extract_mesh(
+    data: &mut dyn AbstractData,
+    path: &sdf::Path,
+    name: &str,
+    world_transform: Matrix4,
+) -> Option<UsdMesh> {
     let points = get_property(data, path, "points")?;
-    let positions: Vec<f32> = points.clone().try_as_vec_3f().or_else(|| points.try_as_float_vec())?;
+    let positions: Vec<f32> = points
+        .clone()
+        .try_as_vec_3f()
+        .or_else(|| points.try_as_float_vec())?;
 
     if positions.is_empty() {
         return None;
     }
 
     let normals = get_property(data, path, "normals").and_then(|v| v.try_as_vec_3f());
-    let face_vertex_counts = get_property(data, path, "faceVertexCounts").and_then(|v| v.try_as_int_vec());
-    let face_vertex_indices = get_property(data, path, "faceVertexIndices").and_then(|v| v.try_as_int_vec());
+    let face_vertex_counts =
+        get_property(data, path, "faceVertexCounts").and_then(|v| v.try_as_int_vec());
+    let face_vertex_indices =
+        get_property(data, path, "faceVertexIndices").and_then(|v| v.try_as_int_vec());
 
     let indices = match (face_vertex_counts, face_vertex_indices) {
         (Some(counts), Some(indices)) => Some(triangulate_faces(&counts, &indices)),
@@ -730,11 +1030,16 @@ fn try_extract_mesh(data: &mut dyn AbstractData, path: &sdf::Path, name: &str) -
         normals,
         indices,
         material,
+        world_transform,
     })
 }
 
-/// Extract meshes from USD data recursively.
-fn extract_meshes(data: &mut dyn AbstractData, root: &sdf::Path) -> Result<Vec<UsdMesh>> {
+/// Extract meshes from USD data recursively, accumulating transforms.
+fn extract_meshes_recursive(
+    data: &mut dyn AbstractData,
+    root: &sdf::Path,
+    parent_transform: Matrix4,
+) -> Result<Vec<UsdMesh>> {
     let mut meshes = Vec::new();
     let children = match data.get(root, "primChildren") {
         Ok(val) => val.into_owned().try_as_token_vec().unwrap_or_default(),
@@ -751,12 +1056,25 @@ fn extract_meshes(data: &mut dyn AbstractData, root: &sdf::Path) -> Result<Vec<U
             sdf::path(format!("{root_str}/{child_name}"))?
         };
 
-        if let Some(mesh) = try_extract_mesh(data, &child_path, &child_name) {
+        // Get local transform and combine with parent
+        let local_transform = get_local_transform(data, &child_path);
+        let world_transform = parent_transform.mul(&local_transform);
+
+        if let Some(mesh) = try_extract_mesh(data, &child_path, &child_name, world_transform) {
             meshes.push(mesh);
         }
-        meshes.extend(extract_meshes(data, &child_path)?);
+        meshes.extend(extract_meshes_recursive(
+            data,
+            &child_path,
+            world_transform,
+        )?);
     }
     Ok(meshes)
+}
+
+/// Extract meshes from USD data recursively.
+fn extract_meshes(data: &mut dyn AbstractData, root: &sdf::Path) -> Result<Vec<UsdMesh>> {
+    extract_meshes_recursive(data, root, Matrix4::identity())
 }
 
 /// Build hierarchy cache from USD data (called once on load).
@@ -797,7 +1115,11 @@ fn update_inspector_cache(data: &mut dyn AbstractData, path: &sdf::Path) -> Insp
         .list(path)
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|field| data.get(path, &field).ok().map(|val| (field, format!("{:?}", val))))
+        .filter_map(|field| {
+            data.get(path, &field)
+                .ok()
+                .map(|val| (field, format!("{:?}", val)))
+        })
         .collect();
 
     InspectorCache {
@@ -864,7 +1186,7 @@ fn create_scene(
 ) -> Scene {
     let needs_transform = up_axis == UpAxis::Z;
 
-    // Parallel bounds calculation
+    // Parallel bounds calculation (apply world transform, then Z-to-Y if needed)
     let (min, max) = if meshes.is_empty() {
         (vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, 0.0))
     } else {
@@ -876,10 +1198,15 @@ fn create_scene(
                 let mut has_data = false;
 
                 for chunk in mesh.positions.chunks(3) {
+                    // Apply world transform first
+                    let (wx, wy, wz) = mesh
+                        .world_transform
+                        .transform_point(chunk[0], chunk[1], chunk[2]);
+                    // Then apply Z-to-Y conversion if needed
                     let (x, y, z) = if needs_transform {
-                        transform_z_to_y(chunk[0], chunk[1], chunk[2])
+                        transform_z_to_y(wx, wy, wz)
                     } else {
-                        (chunk[0], chunk[1], chunk[2])
+                        (wx, wy, wz)
                     };
                     lmin.x = lmin.x.min(x);
                     lmin.y = lmin.y.min(y);
@@ -892,11 +1219,19 @@ fn create_scene(
                 if has_data {
                     (lmin, lmax)
                 } else {
-                    (vec3(f32::MAX, f32::MAX, f32::MAX), vec3(f32::MIN, f32::MIN, f32::MIN))
+                    (
+                        vec3(f32::MAX, f32::MAX, f32::MAX),
+                        vec3(f32::MIN, f32::MIN, f32::MIN),
+                    )
                 }
             })
             .reduce(
-                || (vec3(f32::MAX, f32::MAX, f32::MAX), vec3(f32::MIN, f32::MIN, f32::MIN)),
+                || {
+                    (
+                        vec3(f32::MAX, f32::MAX, f32::MAX),
+                        vec3(f32::MIN, f32::MIN, f32::MIN),
+                    )
+                },
                 |a, b| {
                     (
                         vec3(a.0.x.min(b.0.x), a.0.y.min(b.0.y), a.0.z.min(b.0.z)),
@@ -918,18 +1253,20 @@ fn create_scene(
     let processed_data: Vec<(sdf::Path, CpuMesh, CpuMaterial)> = meshes
         .par_iter()
         .map(|mesh| {
-            // Transform positions
-            let positions: Vec<Vector3<f32>> = if needs_transform {
-                mesh.positions
-                    .chunks(3)
-                    .map(|c| {
-                        let (x, y, z) = transform_z_to_y(c[0], c[1], c[2]);
+            // Transform positions: apply world transform, then Z-to-Y if needed
+            let positions: Vec<Vector3<f32>> = mesh
+                .positions
+                .chunks(3)
+                .map(|c| {
+                    let (wx, wy, wz) = mesh.world_transform.transform_point(c[0], c[1], c[2]);
+                    if needs_transform {
+                        let (x, y, z) = transform_z_to_y(wx, wy, wz);
                         vec3(x, y, z)
-                    })
-                    .collect()
-            } else {
-                mesh.positions.chunks(3).map(|c| vec3(c[0], c[1], c[2])).collect()
-            };
+                    } else {
+                        vec3(wx, wy, wz)
+                    }
+                })
+                .collect();
 
             let indices = match &mesh.indices {
                 Some(idx) => Indices::U32(idx.clone()),
@@ -943,27 +1280,28 @@ fn create_scene(
                 ..Default::default()
             };
 
-            let use_usd_normals = mesh.normals.as_ref().is_some_and(|n| n.len() == mesh.positions.len());
+            let use_usd_normals = mesh
+                .normals
+                .as_ref()
+                .is_some_and(|n| n.len() == mesh.positions.len());
 
             if use_usd_normals {
-                let normals: Vec<Vector3<f32>> = if needs_transform {
-                    mesh.normals
-                        .as_ref()
-                        .unwrap()
-                        .chunks(3)
-                        .map(|c| {
-                            let (x, y, z) = transform_z_to_y(c[0], c[1], c[2]);
+                // Transform normals: apply world transform (rotation only), then Z-to-Y if needed
+                let normals: Vec<Vector3<f32>> = mesh
+                    .normals
+                    .as_ref()
+                    .unwrap()
+                    .chunks(3)
+                    .map(|c| {
+                        let (wx, wy, wz) = mesh.world_transform.transform_normal(c[0], c[1], c[2]);
+                        if needs_transform {
+                            let (x, y, z) = transform_z_to_y(wx, wy, wz);
                             vec3(x, y, z)
-                        })
-                        .collect()
-                } else {
-                    mesh.normals
-                        .as_ref()
-                        .unwrap()
-                        .chunks(3)
-                        .map(|c| vec3(c[0], c[1], c[2]))
-                        .collect()
-                };
+                        } else {
+                            vec3(wx, wy, wz)
+                        }
+                    })
+                    .collect();
                 cpu_mesh.normals = Some(normals);
             } else {
                 cpu_mesh.compute_normals();
@@ -1097,7 +1435,13 @@ fn load_usd_file(
                 }
             };
             let dir = path.parent().map(|p| p.to_path_buf());
-            state.scene = create_scene(context, &meshes, up_axis, state.show_textures, dir.as_deref());
+            state.scene = create_scene(
+                context,
+                &meshes,
+                up_axis,
+                state.show_textures,
+                dir.as_deref(),
+            );
             state.stage = Some(new_stage);
             state.selected_path = None;
             state.hierarchy_cache = Some(hierarchy);
@@ -1120,7 +1464,11 @@ fn load_usd_file(
                 z_near,
                 z_far,
             );
-            *control = OrbitControl::new(state.scene.center, state.scene.size * 0.1, state.scene.size * 10.0);
+            *control = OrbitControl::new(
+                state.scene.center,
+                state.scene.size * 0.1,
+                state.scene.size * 10.0,
+            );
             window.set_title(&format!(
                 "PowerUSD - {}",
                 path.file_name().unwrap_or_default().to_string_lossy()
@@ -1133,11 +1481,18 @@ fn load_usd_file(
 }
 
 /// Render hierarchy from cache (no USD queries).
-fn show_hierarchy_cached(ui: &mut egui::Ui, node: &HierarchyNode, selected: &mut Option<sdf::Path>) {
+fn show_hierarchy_cached(
+    ui: &mut egui::Ui,
+    node: &HierarchyNode,
+    selected: &mut Option<sdf::Path>,
+) {
     let is_selected = selected.as_ref() == Some(&node.path);
 
     if node.children.is_empty() {
-        if ui.selectable_label(is_selected, format!("📄 {}", node.name)).clicked() {
+        if ui
+            .selectable_label(is_selected, format!("📄 {}", node.name))
+            .clicked()
+        {
             *selected = Some(node.path.clone());
         }
     } else {
@@ -1205,14 +1560,23 @@ fn main() {
     let z_far = state.scene.size * 100.0;
     let mut camera = Camera::new_perspective(
         Viewport::new_at_origo(1, 1),
-        state.scene.center + vec3(state.scene.size * 2.0, state.scene.size, state.scene.size * 2.0),
+        state.scene.center
+            + vec3(
+                state.scene.size * 2.0,
+                state.scene.size,
+                state.scene.size * 2.0,
+            ),
         state.scene.center,
         vec3(0.0, 1.0, 0.0),
         degrees(45.0),
         z_near,
         z_far,
     );
-    let mut control = OrbitControl::new(state.scene.center, state.scene.size * 0.1, state.scene.size * 10.0);
+    let mut control = OrbitControl::new(
+        state.scene.center,
+        state.scene.size * 0.1,
+        state.scene.size * 10.0,
+    );
 
     let light0 = DirectionalLight::new(&context, 3.0, Srgba::WHITE, vec3(-1.0, -1.0, -1.0));
     let light1 = DirectionalLight::new(&context, 1.5, Srgba::WHITE, vec3(1.0, 1.0, 1.0));
