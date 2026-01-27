@@ -22,6 +22,14 @@ Fast USD asset browser and viewer built in pure Rust.
   - Hierarchy browser
   - Property inspector
 
+## Dependencies
+
+- [openusd](https://github.com/mxpv/openusd) - Pure Rust USD parser
+- [three-d](https://github.com/asny/three-d) - 3D rendering engine
+- [egui](https://github.com/emilk/egui) - Immediate mode GUI
+- [winit](https://github.com/rust-windowing/winit) - Window handling
+- [arboard](https://github.com/1Password/arboard) - Clipboard support
+
 ## Thumbnails
 
 Place thumbnail images next to your USD files:
@@ -31,7 +39,7 @@ Place thumbnail images next to your USD files:
 ## Building
 
 ```bash
-git clone --recursive https://github.com/paxsethux/powerusd.git
+git clone --recursive https://github.com/cl0nazepamm/powerusd.git
 cd powerusd
 cargo build --release
 ```
