@@ -1,0 +1,6 @@
+[submodule "deps/openusd"]
+	path = deps/openusd
+	url = https://github.com/mxpv/openusd.git
+[submodule "deps/three-d"]
+	path = deps/three-d
+	url = https://github.com/asny/three-d.git

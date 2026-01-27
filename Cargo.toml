@@ -1,0 +1,24 @@
+[package]
+name = "powerusd"
+version = "0.1.0"
+edition = "2021"
+description = "Fast USD asset browser and viewer"
+license = "MIT"
+repository = "https://github.com/paxsethux/powerusd"
+keywords = ["usd", "openusd", "3d", "asset-browser", "viewer"]
+categories = ["graphics", "rendering", "visualization"]
+
+[dependencies]
+openusd = { path = "deps/openusd" }
+three-d = { path = "deps/three-d", features = ["egui-gui"] }
+anyhow = "1.0"
+winit = "0.28"
+egui = "0.32"
+image = "0.25"
+rayon = "1.7"
+arboard = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
