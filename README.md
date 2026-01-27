@@ -12,10 +12,9 @@ Fast USD asset browser and viewer built in pure Rust.
   - Custom library paths
 
 - **3D Viewer**
-  - USD/USDA/USDC/USDZ support
+  - USD/USDA/USDC support
   - Drag & drop file loading
   - Orbit camera controls
-  - Material and texture support
   - Z-up to Y-up conversion (3ds Max support)
 
 - **Scene Inspector**
