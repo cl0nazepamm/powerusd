@@ -17,6 +17,7 @@ egui = "0.32"
 image = "0.25"
 rayon = "1.7"
 arboard = "3"
+quick-xml = "0.37"
 
 [profile.release]
 lto = true

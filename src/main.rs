@@ -61,8 +61,13 @@ struct UsdPreviewSurface {
     diffuse_color: [f32; 3],
     diffuse_texture: Option<String>,
     metallic: f32,
+    metallic_texture: Option<String>,
     roughness: f32,
+    roughness_texture: Option<String>,
+    normal_texture: Option<String>,
+    occlusion_texture: Option<String>,
     emissive_color: [f32; 3],
+    emissive_texture: Option<String>,
     opacity: f32,
 }
 
@@ -72,14 +77,254 @@ impl Default for UsdPreviewSurface {
             diffuse_color: [0.18, 0.18, 0.18], // USD default
             diffuse_texture: None,
             metallic: 0.0,
+            metallic_texture: None,
             roughness: 0.5,
+            roughness_texture: None,
+            normal_texture: None,
+            occlusion_texture: None,
             emissive_color: [0.0, 0.0, 0.0],
+            emissive_texture: None,
             opacity: 1.0,
         }
     }
 }
 
-// ... existing code ...
+/// Parse MaterialX file and extract standard_surface materials.
+/// Returns a map of material name to UsdPreviewSurface.
+fn parse_materialx(mtlx_content: &str) -> std::collections::HashMap<String, UsdPreviewSurface> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+    use std::collections::HashMap;
+
+    let mut materials: HashMap<String, UsdPreviewSurface> = HashMap::new();
+    // Map: nodegraph_name -> (output_name -> file_path)
+    let mut nodegraph_files: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+    let mut reader = Reader::from_str(mtlx_content);
+    reader.config_mut().trim_text(true);
+
+    let mut current_nodegraph: Option<String> = None;
+    let mut current_image_node: Option<String> = None;
+    let mut current_surface: Option<(String, UsdPreviewSurface)> = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let attrs: HashMap<String, String> = e
+                    .attributes()
+                    .flatten()
+                    .map(|a| {
+                        (
+                            String::from_utf8_lossy(a.key.as_ref()).to_string(),
+                            String::from_utf8_lossy(&a.value).to_string(),
+                        )
+                    })
+                    .collect();
+
+                match tag.as_str() {
+                    "nodegraph" => {
+                        current_nodegraph = attrs.get("name").cloned();
+                    }
+                    "tiledimage" | "image" => {
+                        current_image_node = attrs.get("name").cloned();
+                    }
+                    "input" => {
+                        let input_name = attrs.get("name").map(|s| s.as_str()).unwrap_or("");
+                        let input_value = attrs.get("value").cloned().unwrap_or_default();
+
+                        // File path inside image node
+                        if input_name == "file" && current_image_node.is_some() {
+                            if let (Some(ref ng), Some(ref node)) =
+                                (&current_nodegraph, &current_image_node)
+                            {
+                                nodegraph_files
+                                    .entry(ng.clone())
+                                    .or_default()
+                                    .insert(node.clone(), input_value.clone());
+                            }
+                        }
+
+                        // Standard surface inputs
+                        if let Some((_, ref mut mat)) = current_surface {
+                            let nodegraph = attrs.get("nodegraph").cloned();
+                            let output = attrs.get("output").cloned();
+
+                            match input_name {
+                                "base_color" => {
+                                    if let (Some(ng), Some(out)) = (nodegraph, output) {
+                                        // Resolve texture: find file from nodegraph
+                                        if let Some(files) = nodegraph_files.get(&ng) {
+                                            // Output name maps to node name, which maps to file
+                                            if let Some(file) = files.get(&out) {
+                                                mat.diffuse_texture = Some(file.clone());
+                                            }
+                                        }
+                                    } else if !input_value.is_empty() {
+                                        mat.diffuse_color = parse_color3(&input_value);
+                                    }
+                                }
+                                "metalness" => {
+                                    if let Ok(v) = input_value.parse::<f32>() {
+                                        mat.metallic = v;
+                                    }
+                                }
+                                "specular_roughness" => {
+                                    if let Ok(v) = input_value.parse::<f32>() {
+                                        mat.roughness = v;
+                                    }
+                                }
+                                "emission_color" => {
+                                    if !input_value.is_empty() {
+                                        mat.emissive_color = parse_color3(&input_value);
+                                    }
+                                }
+                                "normal" => {
+                                    if let (Some(ng), Some(out)) =
+                                        (attrs.get("nodegraph"), attrs.get("output"))
+                                    {
+                                        if let Some(files) = nodegraph_files.get(ng) {
+                                            if let Some(file) = files.get(out) {
+                                                mat.normal_texture = Some(file.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    "output" => {
+                        // Map output name to source node for texture resolution
+                        if let Some(ref ng) = current_nodegraph {
+                            if let (Some(out_name), Some(node_name)) =
+                                (attrs.get("name"), attrs.get("nodename"))
+                            {
+                                // Copy file path from source node to output name
+                                if let Some(files) = nodegraph_files.get_mut(ng) {
+                                    if let Some(file) = files.get(node_name).cloned() {
+                                        files.insert(out_name.clone(), file);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "standard_surface" => {
+                        if let Some(name) = attrs.get("name") {
+                            current_surface = Some((name.clone(), UsdPreviewSurface::default()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                match tag.as_str() {
+                    "nodegraph" => current_nodegraph = None,
+                    "tiledimage" | "image" => current_image_node = None,
+                    "standard_surface" => {
+                        if let Some((name, mat)) = current_surface.take() {
+                            materials.insert(name, mat);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    materials
+}
+
+/// Parse a MaterialX color3 value like "1, 0.5, 0.2" or "1 0.5 0.2"
+fn parse_color3(value: &str) -> [f32; 3] {
+    let parts: Vec<f32> = value
+        .split([',', ' '])
+        .filter_map(|s| s.trim().parse::<f32>().ok())
+        .collect();
+    if parts.len() >= 3 {
+        [parts[0], parts[1], parts[2]]
+    } else {
+        [0.18, 0.18, 0.18]
+    }
+}
+
+/// Load MaterialX file and parse materials.
+fn load_materialx(path: &Path) -> std::collections::HashMap<String, UsdPreviewSurface> {
+    if let Ok(content) = std::fs::read_to_string(path) {
+        parse_materialx(&content)
+    } else {
+        std::collections::HashMap::new()
+    }
+}
+
+/// Scan directory for .mtlx files and load all MaterialX materials.
+fn load_materialx_from_dir(dir: &Path) -> std::collections::HashMap<String, UsdPreviewSurface> {
+    let mut all_materials = std::collections::HashMap::new();
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "mtlx") {
+                println!("Loading MaterialX: {}", path.display());
+                let mats = load_materialx(&path);
+                for (name, mat) in mats {
+                    all_materials.insert(name, mat);
+                }
+            }
+        }
+    }
+
+    if !all_materials.is_empty() {
+        println!("Loaded {} MaterialX materials", all_materials.len());
+    }
+
+    all_materials
+}
+
+/// Apply MaterialX materials to meshes, overriding USD materials where names match.
+fn apply_materialx_to_meshes(
+    meshes: &mut [UsdMesh],
+    mtlx_materials: &std::collections::HashMap<String, UsdPreviewSurface>,
+    data: &mut dyn AbstractData,
+) {
+    if mtlx_materials.is_empty() {
+        return;
+    }
+
+    for mesh in meshes.iter_mut() {
+        // Get the material binding name from the mesh
+        if let Some(material_path) = get_material_binding(data, &mesh.path) {
+            // Extract material name from path (last component)
+            let mat_name = material_path
+                .as_str()
+                .split('/')
+                .next_back()
+                .unwrap_or("")
+                .to_string();
+
+            // Try to find matching MaterialX material
+            // Match by exact name or by removing common prefixes
+            let mtlx_mat = mtlx_materials
+                .get(&mat_name)
+                .or_else(|| mtlx_materials.get(&format!("m_{}", mat_name)))
+                .or_else(|| {
+                    // Try matching by suffix (material name without prefix)
+                    mtlx_materials
+                        .iter()
+                        .find(|(k, _)| k.ends_with(&mat_name) || mat_name.ends_with(k.as_str()))
+                        .map(|(_, v)| v)
+                });
+
+            if let Some(mtlx) = mtlx_mat {
+                mesh.material = Some(mtlx.clone());
+            }
+        }
+    }
+}
 
 fn get_shader_texture_path(
     data: &mut dyn AbstractData,
@@ -138,23 +383,102 @@ fn extract_preview_surface(
 ) -> UsdPreviewSurface {
     let mut mat = UsdPreviewSurface::default();
 
+    // Diffuse/Albedo
     if let Some(color) = get_shader_color3f(data, shader_path, "diffuseColor") {
         mat.diffuse_color = color;
     }
-    // Try to get texture connection for diffuseColor
     if let Some(tex_path) = get_shader_texture_path(data, shader_path, "diffuseColor") {
         mat.diffuse_texture = Some(tex_path);
     }
 
-    if let Some(color) = get_shader_color3f(data, shader_path, "emissiveColor") {
-        mat.emissive_color = color;
-    }
+    // Metallic
     if let Some(v) = get_shader_float(data, shader_path, "metallic") {
         mat.metallic = v;
     }
+    if let Some(tex_path) = get_shader_texture_path(data, shader_path, "metallic") {
+        mat.metallic_texture = Some(tex_path);
+    }
+
+    // Roughness
     if let Some(v) = get_shader_float(data, shader_path, "roughness") {
         mat.roughness = v;
     }
+    if let Some(tex_path) = get_shader_texture_path(data, shader_path, "roughness") {
+        mat.roughness_texture = Some(tex_path);
+    }
+
+    // Normal map
+    if let Some(tex_path) = get_shader_texture_path(data, shader_path, "normal") {
+        mat.normal_texture = Some(tex_path);
+    }
+
+    // Occlusion/AO
+    if let Some(tex_path) = get_shader_texture_path(data, shader_path, "occlusion") {
+        mat.occlusion_texture = Some(tex_path);
+    }
+
+    // Emissive
+    if let Some(color) = get_shader_color3f(data, shader_path, "emissiveColor") {
+        mat.emissive_color = color;
+    }
+    if let Some(tex_path) = get_shader_texture_path(data, shader_path, "emissiveColor") {
+        mat.emissive_texture = Some(tex_path);
+    }
+
+    // Opacity
+    if let Some(v) = get_shader_float(data, shader_path, "opacity") {
+        mat.opacity = v;
+    }
+
+    mat
+}
+
+/// Extract MaterialX standard_surface properties from a shader prim.
+/// MaterialX uses different input names than UsdPreviewSurface.
+fn extract_materialx_surface(
+    data: &mut dyn AbstractData,
+    shader_path: &sdf::Path,
+) -> UsdPreviewSurface {
+    let mut mat = UsdPreviewSurface::default();
+
+    // Base color (MaterialX: base_color, base)
+    if let Some(color) = get_shader_color3f(data, shader_path, "base_color") {
+        mat.diffuse_color = color;
+    }
+    if let Some(tex_path) = get_shader_texture_path(data, shader_path, "base_color") {
+        mat.diffuse_texture = Some(tex_path);
+    }
+
+    // Metalness (MaterialX: metalness)
+    if let Some(v) = get_shader_float(data, shader_path, "metalness") {
+        mat.metallic = v;
+    }
+    if let Some(tex_path) = get_shader_texture_path(data, shader_path, "metalness") {
+        mat.metallic_texture = Some(tex_path);
+    }
+
+    // Roughness (MaterialX: specular_roughness)
+    if let Some(v) = get_shader_float(data, shader_path, "specular_roughness") {
+        mat.roughness = v;
+    }
+    if let Some(tex_path) = get_shader_texture_path(data, shader_path, "specular_roughness") {
+        mat.roughness_texture = Some(tex_path);
+    }
+
+    // Normal map (MaterialX: normal)
+    if let Some(tex_path) = get_shader_texture_path(data, shader_path, "normal") {
+        mat.normal_texture = Some(tex_path);
+    }
+
+    // Emissive (MaterialX: emission_color)
+    if let Some(color) = get_shader_color3f(data, shader_path, "emission_color") {
+        mat.emissive_color = color;
+    }
+    if let Some(tex_path) = get_shader_texture_path(data, shader_path, "emission_color") {
+        mat.emissive_texture = Some(tex_path);
+    }
+
+    // Opacity (MaterialX: opacity for surface, or transmission for glass)
     if let Some(v) = get_shader_float(data, shader_path, "opacity") {
         mat.opacity = v;
     }
@@ -533,11 +857,31 @@ fn is_preview_surface_shader(data: &mut dyn AbstractData, prim_path: &sdf::Path)
     false
 }
 
-/// Find UsdPreviewSurface shader within a material (recursive search).
-fn find_preview_surface_shader(
+/// Check if a prim is a MaterialX standard_surface shader.
+fn is_materialx_standard_surface(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> bool {
+    if let Ok(info_id_path) = prim_path.append_property("info:id") {
+        if let Ok(val) = data.get(&info_id_path, "default") {
+            if let Some(token) = val.into_owned().try_as_token() {
+                // MaterialX node definitions: ND_standard_surface_surfaceshader, standard_surface, etc.
+                return token.contains("standard_surface");
+            }
+        }
+    }
+    false
+}
+
+/// Shader type found during material search.
+enum ShaderType {
+    UsdPreviewSurface,
+    MaterialXStandardSurface,
+}
+
+/// Find surface shader within a material (recursive search).
+/// Returns the shader path and its type.
+fn find_surface_shader(
     data: &mut dyn AbstractData,
     prim_path: &sdf::Path,
-) -> Option<sdf::Path> {
+) -> Option<(sdf::Path, ShaderType)> {
     let children = data
         .get(prim_path, "primChildren")
         .ok()?
@@ -549,10 +893,14 @@ fn find_preview_surface_shader(
         let child_path = sdf::path(format!("{}/{}", prim_str, child_name)).ok()?;
 
         if is_preview_surface_shader(data, &child_path) {
-            return Some(child_path);
+            return Some((child_path, ShaderType::UsdPreviewSurface));
         }
 
-        if let Some(found) = find_preview_surface_shader(data, &child_path) {
+        if is_materialx_standard_surface(data, &child_path) {
+            return Some((child_path, ShaderType::MaterialXStandardSurface));
+        }
+
+        if let Some(found) = find_surface_shader(data, &child_path) {
             return Some(found);
         }
     }
@@ -648,8 +996,18 @@ fn get_mesh_material(
     prim_path: &sdf::Path,
 ) -> Option<UsdPreviewSurface> {
     let material_path = get_material_binding(data, prim_path)?;
-    let shader_path = find_preview_surface_shader(data, &material_path)?;
-    Some(extract_preview_surface(data, &shader_path))
+    let (shader_path, shader_type) = find_surface_shader(data, &material_path)?;
+
+    Some(match shader_type {
+        ShaderType::UsdPreviewSurface => extract_preview_surface(data, &shader_path),
+        ShaderType::MaterialXStandardSurface => {
+            println!(
+                "Found MaterialX standard_surface: {}",
+                shader_path.as_str()
+            );
+            extract_materialx_surface(data, &shader_path)
+        }
+    })
 }
 
 /// Try to extract mesh data from a single prim path.
@@ -1124,21 +1482,29 @@ fn create_scene(
             }
 
             let cpu_material = if let Some(ref usd_mat) = mesh.material {
-                let albedo_texture = if show_textures {
-                    if let Some(ref tex_path) = usd_mat.diffuse_texture {
-                        let clean_path = clean_asset_path(tex_path);
-                        if let Some(dir) = base_dir {
-                            let full_path = dir.join(&clean_path);
-                            load_texture(&full_path)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
+                // Helper to load texture from USD path
+                let load_tex = |tex_opt: &Option<String>| -> Option<CpuTexture> {
+                    if !show_textures {
+                        return None;
                     }
-                } else {
-                    None
+                    tex_opt.as_ref().and_then(|tex_path| {
+                        let clean_path = clean_asset_path(tex_path);
+                        base_dir
+                            .map(|dir| dir.join(&clean_path))
+                            .and_then(|full_path| load_texture(&full_path))
+                    })
                 };
+
+                let albedo_texture = load_tex(&usd_mat.diffuse_texture);
+                // USD has separate metallic/roughness textures, three-d expects packed
+                // Use metallic texture if available (value in any channel works)
+                // TODO: Pack metallic (B) + roughness (G) at runtime for full support
+                let metallic_roughness_texture = load_tex(&usd_mat.metallic_texture)
+                    .or_else(|| load_tex(&usd_mat.roughness_texture));
+                let normal_texture = load_tex(&usd_mat.normal_texture);
+                // Occlusion is separate in both USD and three-d
+                let occlusion_texture = load_tex(&usd_mat.occlusion_texture);
+                let emissive_texture = load_tex(&usd_mat.emissive_texture);
 
                 let to_srgb = |c: f32| -> u8 { (c.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8 };
                 let albedo = Srgba::new(
@@ -1158,7 +1524,11 @@ fn create_scene(
                     albedo_texture,
                     metallic: usd_mat.metallic,
                     roughness: usd_mat.roughness,
+                    metallic_roughness_texture,
+                    normal_texture,
+                    occlusion_texture,
                     emissive,
+                    emissive_texture,
                     ..Default::default()
                 }
             } else {
@@ -1220,6 +1590,11 @@ struct AppState {
     base_dir: Option<PathBuf>,
     up_axis: UpAxis,
     asset_library: AssetLibrary,
+    // Rendering options
+    use_environment: bool,
+    metallic_override: f32,
+    roughness_override: f32,
+    use_material_overrides: bool,
 }
 
 /// Load a USD file and update application state.
@@ -1240,7 +1615,7 @@ fn load_usd_file(
                 println!("Detected Z-up scene (3ds Max), applying coordinate conversion");
             }
             let hierarchy = build_hierarchy_cache(new_stage.as_mut(), &sdf::Path::abs_root());
-            let meshes = match extract_meshes(new_stage.as_mut(), &sdf::Path::abs_root()) {
+            let mut meshes = match extract_meshes(new_stage.as_mut(), &sdf::Path::abs_root()) {
                 Ok(m) => {
                     println!("Loaded {} meshes", m.len());
                     m
@@ -1251,6 +1626,14 @@ fn load_usd_file(
                 }
             };
             let dir = path.parent().map(|p| p.to_path_buf());
+
+            // Load MaterialX materials from the same directory
+            if let Some(ref base_dir) = dir {
+                let mtlx_materials = load_materialx_from_dir(base_dir);
+                if !mtlx_materials.is_empty() {
+                    apply_materialx_to_meshes(&mut meshes, &mtlx_materials, new_stage.as_mut());
+                }
+            }
             state.scene = create_scene(
                 context,
                 &meshes,
@@ -1340,10 +1723,18 @@ fn main() {
             Ok(mut stage) => {
                 let axis = get_up_axis(stage.as_mut());
                 let hierarchy = build_hierarchy_cache(stage.as_mut(), &sdf::Path::abs_root());
-                let m = extract_meshes(stage.as_mut(), &sdf::Path::abs_root()).unwrap_or_default();
+                let mut m =
+                    extract_meshes(stage.as_mut(), &sdf::Path::abs_root()).unwrap_or_default();
                 let dir = path.parent().map(|p| p.to_path_buf());
                 if axis == UpAxis::Z {
                     println!("Detected Z-up scene (3ds Max), applying coordinate conversion");
+                }
+                // Load MaterialX materials from the same directory
+                if let Some(ref base_dir) = dir {
+                    let mtlx_materials = load_materialx_from_dir(base_dir);
+                    if !mtlx_materials.is_empty() {
+                        apply_materialx_to_meshes(&mut m, &mtlx_materials, stage.as_mut());
+                    }
                 }
                 (Some(stage), m, axis, Some(hierarchy), dir)
             }
@@ -1362,11 +1753,15 @@ fn main() {
         selected_path: None,
         hierarchy_cache,
         inspector_cache: InspectorCache::default(),
-        show_textures: false, // Default off
+        show_textures: false,
         meshes,
         base_dir,
         up_axis,
         asset_library: AssetLibrary::default(),
+        use_environment: false,
+        metallic_override: 0.0,
+        roughness_override: 0.5,
+        use_material_overrides: false,
     };
 
     let mut last_frame_time = std::time::Instant::now();
@@ -1397,6 +1792,8 @@ fn main() {
     let light0 = DirectionalLight::new(&context, 3.0, Srgba::WHITE, vec3(-1.0, -1.0, -1.0));
     let light1 = DirectionalLight::new(&context, 1.5, Srgba::WHITE, vec3(1.0, 1.0, 1.0));
     let ambient = AmbientLight::new(&context, 0.05, Srgba::WHITE);
+    // Stronger ambient for environment mode (simulates sky dome lighting)
+    let env_ambient = AmbientLight::new(&context, 0.8, Srgba::new(200, 210, 230, 255));
 
     let mut frame_input_generator = FrameInputGenerator::from_winit_window(&window);
 
@@ -1525,6 +1922,25 @@ fn main() {
                                     );
                                 }
 
+                                ui.checkbox(&mut state.use_environment, "Environment Light");
+
+                                ui.separator();
+
+                                ui.checkbox(
+                                    &mut state.use_material_overrides,
+                                    "Material Overrides",
+                                );
+                                if state.use_material_overrides {
+                                    ui.add(
+                                        egui::Slider::new(&mut state.metallic_override, 0.0..=1.0)
+                                            .text("Metallic"),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(&mut state.roughness_override, 0.0..=1.0)
+                                            .text("Roughness"),
+                                    );
+                                }
+
                                 ui.separator();
                                 ui.label("Press SPACE for Asset Library");
                             });
@@ -1601,19 +2017,42 @@ fn main() {
                     }
                 }
 
-                let screen = frame_input.screen();
-                screen.clear(ClearState::color_and_depth(0.15, 0.15, 0.18, 1.0, 1.0));
+                // Apply material overrides if enabled
+                if state.use_material_overrides {
+                    for (_path, model) in state.scene.models.iter_mut() {
+                        model.material.metallic = state.metallic_override;
+                        model.material.roughness = state.roughness_override;
+                    }
+                }
 
-                screen.render(
-                    &camera,
-                    state
-                        .scene
-                        .models
-                        .iter()
-                        .map(|(_p, m)| m as &dyn Object)
-                        .chain(std::iter::once(&state.scene.axes as &dyn Object)),
-                    &[&light0, &light1, &ambient],
-                );
+                let screen = frame_input.screen();
+
+                // Use environment lighting or standard lighting
+                if state.use_environment {
+                    screen.clear(ClearState::color_and_depth(0.4, 0.45, 0.5, 1.0, 1.0));
+                    screen.render(
+                        &camera,
+                        state
+                            .scene
+                            .models
+                            .iter()
+                            .map(|(_p, m)| m as &dyn Object)
+                            .chain(std::iter::once(&state.scene.axes as &dyn Object)),
+                        &[&light0, &env_ambient],
+                    );
+                } else {
+                    screen.clear(ClearState::color_and_depth(0.15, 0.15, 0.18, 1.0, 1.0));
+                    screen.render(
+                        &camera,
+                        state
+                            .scene
+                            .models
+                            .iter()
+                            .map(|(_p, m)| m as &dyn Object)
+                            .chain(std::iter::once(&state.scene.axes as &dyn Object)),
+                        &[&light0, &light1, &ambient],
+                    );
+                }
 
                 screen.write(|| gui.render()).unwrap();
 
