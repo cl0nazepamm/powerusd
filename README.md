@@ -10,6 +10,7 @@ Fast USD asset browser and viewer built in pure Rust.
   - Fast directory scanning
   - Search functionality
   - Custom library paths
+  - USDPreviewSurface support.
 
 - **3D Viewer**
   - USD/USDA/USDC support
@@ -50,6 +51,12 @@ cargo build --release
 - **Middle Mouse** - Pan camera
 - **Scroll** - Zoom
 - **Drag & Drop** - Load USD file
+
+
+## Issues
+Blender USD files load materials fine. 3dsmax don't. Autodesk's USD exporter is a mess. Trying to figure it out.
+
+
 
 ## License
 
