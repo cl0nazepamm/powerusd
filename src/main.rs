@@ -1764,8 +1764,6 @@ fn main() {
         use_material_overrides: false,
     };
 
-    let mut last_frame_time = std::time::Instant::now();
-
     // Near/far planes scaled to scene size to avoid z-fighting
     let z_near = (state.scene.size * 0.01).max(0.1);
     let z_far = state.scene.size * 100.0;
@@ -1809,13 +1807,7 @@ fn main() {
             WinitEvent::RedrawRequested(_) => {
                 let mut frame_input = frame_input_generator.generate(&context);
 
-                // Calculate delta time for animations
-                let now = std::time::Instant::now();
-                let dt = (now - last_frame_time).as_secs_f32();
-                last_frame_time = now;
-
-                // Update asset library animation and poll for scan results
-                state.asset_library.update_animation(dt);
+                // Update asset library poll for scan results
                 state.asset_library.poll_scan();
 
                 // Update inspector cache only when selection changes
@@ -1947,16 +1939,14 @@ fn main() {
                         });
 
                         // Asset library bottom panel with slide animation
-                        if state.asset_library.should_render() {
-                            let panel_height = 280.0 * state.asset_library.anim_progress;
-                            egui::TopBottomPanel::bottom("asset_library")
-                                .exact_height(panel_height)
-                                .show(gui_context, |ui| {
-                                    if let Some(path) = state.asset_library.show(gui_context, ui) {
-                                        file_to_load = Some(path);
-                                    }
-                                });
-                        }
+                        egui::TopBottomPanel::bottom("asset_library")
+                            .resizable(true)
+                            .default_height(280.0)
+                            .show_animated(gui_context, state.asset_library.visible, |ui| {
+                                if let Some(path) = state.asset_library.show(gui_context, ui) {
+                                    file_to_load = Some(path);
+                                }
+                            });
 
                         available_rect = gui_context.available_rect();
                     },
