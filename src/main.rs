@@ -1283,10 +1283,13 @@ fn transform_z_to_y(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
     (x, z, -y)
 }
 
+/// Maximum texture size to prevent memory/VRAM issues with production assets.
+const MAX_TEXTURE_SIZE: u32 = 512;
+
 /// Load a texture from disk into a CpuTexture.
-/// Preserves original image format for efficiency.
+/// Resizes to MAX_TEXTURE_SIZE to prevent memory/VRAM issues with large textures.
 fn load_texture(path: &Path) -> Option<CpuTexture> {
-    use image::{DynamicImage, ImageReader};
+    use image::{imageops::FilterType, DynamicImage, ImageReader};
     use std::io::Cursor;
 
     let bytes = std::fs::read(path).ok()?;
@@ -1294,6 +1297,13 @@ fn load_texture(path: &Path) -> Option<CpuTexture> {
         .with_guessed_format()
         .ok()?;
     let img = reader.decode().ok()?;
+
+    // Resize if larger than max size (fast Triangle filter for downscaling)
+    let img = if img.width() > MAX_TEXTURE_SIZE || img.height() > MAX_TEXTURE_SIZE {
+        img.resize(MAX_TEXTURE_SIZE, MAX_TEXTURE_SIZE, FilterType::Triangle)
+    } else {
+        img
+    };
 
     let width = img.width();
     let height = img.height();
@@ -1495,16 +1505,13 @@ fn create_scene(
                     })
                 };
 
+                // Only load diffuse texture for now to save memory
+                // TODO: Enable full PBR textures when memory management is improved
                 let albedo_texture = load_tex(&usd_mat.diffuse_texture);
-                // USD has separate metallic/roughness textures, three-d expects packed
-                // Use metallic texture if available (value in any channel works)
-                // TODO: Pack metallic (B) + roughness (G) at runtime for full support
-                let metallic_roughness_texture = load_tex(&usd_mat.metallic_texture)
-                    .or_else(|| load_tex(&usd_mat.roughness_texture));
-                let normal_texture = load_tex(&usd_mat.normal_texture);
-                // Occlusion is separate in both USD and three-d
-                let occlusion_texture = load_tex(&usd_mat.occlusion_texture);
-                let emissive_texture = load_tex(&usd_mat.emissive_texture);
+                let metallic_roughness_texture: Option<CpuTexture> = None;
+                let normal_texture: Option<CpuTexture> = None;
+                let occlusion_texture: Option<CpuTexture> = None;
+                let emissive_texture: Option<CpuTexture> = None;
 
                 let to_srgb = |c: f32| -> u8 { (c.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8 };
                 let albedo = Srgba::new(
@@ -1706,6 +1713,17 @@ fn show_hierarchy_cached(
 }
 
 fn main() {
+    // Limit rayon threads to half of available cores to prevent CPU lockout
+    let num_threads = (std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        / 2)
+    .max(2);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .ok();
+
     let args: Vec<String> = env::args().collect();
     let initial_file: Option<PathBuf> = args.get(1).map(PathBuf::from);
 

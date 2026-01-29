@@ -2,7 +2,9 @@
 
 Fast USD asset browser and viewer built in pure Rust.
 
-## Features
+## Interface
+![Alt text](images/PowerUSD.png)
+-  PowerUSD loading a Kitbash3D asset.It loads the asset instantly. Textures are disabled by default enabling them takes a few seconds to load.
 
 - **Asset Library Browser** - Press SPACE to toggle
   - Grid and list view modes
@@ -10,10 +12,11 @@ Fast USD asset browser and viewer built in pure Rust.
   - Fast directory scanning
   - Search functionality
   - Custom library paths
-  - USDPreviewSurface support.
+  - USDPreviewSurface (color channel only, full pbr in future)
+  - Efficent and multithreaded texture loading/resizing.
 
 - **3D Viewer**
-  - USD/USDA/USDC support
+  - USD/USDC support
   - Drag & drop file loading
   - Orbit camera controls
   - Z-up to Y-up conversion (3ds Max support)
