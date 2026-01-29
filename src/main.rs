@@ -10,7 +10,6 @@ use ui::asset_library::AssetLibrary;
 use ui::theme::configure_theme;
 
 use anyhow::{bail, Result};
-use image::GenericImageView;
 use openusd::{
     sdf::{self, AbstractData},
     usda::TextReader,
@@ -313,7 +312,6 @@ struct UsdMesh {
     positions: Vec<f32>,
     normals: Option<Vec<f32>>,
     uvs: Option<Vec<f32>>,
-    uv_indices: Option<Vec<i32>>,
     indices: Option<Vec<u32>>,
     material: Option<UsdPreviewSurface>,
     /// World transform accumulated from ancestors.
@@ -674,7 +672,7 @@ fn try_extract_mesh(
     let normals = get_property(data, path, "normals").and_then(|v| v.try_as_vec_3f());
 
     // Try to get UVs from common primvar names
-    let uvs = get_property(data, path, "primvars:st")
+    let raw_uvs = get_property(data, path, "primvars:st")
         .or_else(|| get_property(data, path, "primvars:st0"))
         .or_else(|| get_property(data, path, "primvars:uv"))
         .or_else(|| get_property(data, path, "primvars:UVMap"))
@@ -692,21 +690,113 @@ fn try_extract_mesh(
     let face_vertex_indices =
         get_property(data, path, "faceVertexIndices").and_then(|v| v.try_as_int_vec());
 
+    // Try to get material
+    let material = get_mesh_material(data, path);
+
+    // Determine if we need to expand the mesh for face-varying UVs
+    let vertex_count = positions.len() / 3;
+    let uv_count = raw_uvs.as_ref().map(|u| u.len() / 2).unwrap_or(0);
+    let face_vert_count = face_vertex_indices.as_ref().map(|f| f.len()).unwrap_or(0);
+
+    // Check if UVs are face-varying (count matches face vertices, not positions)
+    let uvs_are_face_varying = uv_count > 0
+        && uv_count != vertex_count
+        && (uv_count == face_vert_count || uv_indices.is_some());
+
+    if uvs_are_face_varying {
+        // Expand mesh: each face-vertex becomes a unique vertex
+        if let (Some(counts), Some(fv_indices)) = (&face_vertex_counts, &face_vertex_indices) {
+            let raw_uvs = raw_uvs.unwrap();
+
+            // Triangulate and expand in one pass
+            let mut expanded_positions = Vec::new();
+            let mut expanded_normals: Option<Vec<f32>> = normals.as_ref().map(|_| Vec::new());
+            let mut expanded_uvs = Vec::new();
+            let mut expanded_indices = Vec::new();
+
+            let mut fv_offset = 0usize;
+            let mut out_idx = 0u32;
+
+            for &count in counts {
+                let count = count as usize;
+                if count < 3 {
+                    fv_offset += count;
+                    continue;
+                }
+
+                // Fan triangulation: (0, 1, 2), (0, 2, 3), (0, 3, 4), ...
+                for i in 1..(count - 1) {
+                    let tri_fv = [fv_offset, fv_offset + i, fv_offset + i + 1];
+
+                    for &fv_idx in &tri_fv {
+                        // Get vertex index from face-vertex index
+                        let vert_idx = fv_indices[fv_idx] as usize;
+
+                        // Expand position
+                        expanded_positions.push(positions[vert_idx * 3]);
+                        expanded_positions.push(positions[vert_idx * 3 + 1]);
+                        expanded_positions.push(positions[vert_idx * 3 + 2]);
+
+                        // Expand normals if present
+                        if let (Some(ref n), Some(ref mut en)) = (&normals, &mut expanded_normals) {
+                            // Normals might be per-vertex or per-face-vertex
+                            if n.len() / 3 == vertex_count {
+                                en.push(n[vert_idx * 3]);
+                                en.push(n[vert_idx * 3 + 1]);
+                                en.push(n[vert_idx * 3 + 2]);
+                            } else if n.len() / 3 >= face_vert_count {
+                                en.push(n[fv_idx * 3]);
+                                en.push(n[fv_idx * 3 + 1]);
+                                en.push(n[fv_idx * 3 + 2]);
+                            }
+                        }
+
+                        // Expand UVs
+                        let uv_idx = if let Some(ref uv_idx_array) = uv_indices {
+                            uv_idx_array[fv_idx] as usize
+                        } else {
+                            fv_idx
+                        };
+                        if uv_idx * 2 + 1 < raw_uvs.len() {
+                            expanded_uvs.push(raw_uvs[uv_idx * 2]);
+                            expanded_uvs.push(raw_uvs[uv_idx * 2 + 1]);
+                        } else {
+                            expanded_uvs.push(0.0);
+                            expanded_uvs.push(0.0);
+                        }
+
+                        expanded_indices.push(out_idx);
+                        out_idx += 1;
+                    }
+                }
+                fv_offset += count;
+            }
+
+            return Some(UsdMesh {
+                path: path.clone(),
+                name: name.to_string(),
+                positions: expanded_positions,
+                normals: expanded_normals,
+                uvs: Some(expanded_uvs),
+                indices: Some(expanded_indices),
+                material,
+                world_transform,
+            });
+        }
+    }
+
+    // Standard path: vertex-interpolated UVs or no UVs
     let indices = match (face_vertex_counts, face_vertex_indices) {
         (Some(counts), Some(indices)) => Some(triangulate_faces(&counts, &indices)),
         _ => None,
     };
-
-    // Try to get material
-    let material = get_mesh_material(data, path);
 
     Some(UsdMesh {
         path: path.clone(),
         name: name.to_string(),
         positions,
         normals,
-        uvs,
-        uv_indices,
+        uvs: raw_uvs,
         indices,
         material,
         world_transform,
@@ -836,20 +926,58 @@ fn transform_z_to_y(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
 }
 
 /// Load a texture from disk into a CpuTexture.
+/// Preserves original image format for efficiency.
 fn load_texture(path: &Path) -> Option<CpuTexture> {
-    if let Ok(img) = image::open(path) {
-        let (width, height) = img.dimensions();
-        let img = img.to_rgba8();
-        let data: Vec<[u8; 4]> = img.pixels().map(|p| p.0).collect();
-        Some(CpuTexture {
-            data: TextureData::RgbaU8(data),
-            width,
-            height,
-            ..Default::default()
-        })
-    } else {
-        None
-    }
+    use image::{DynamicImage, ImageReader};
+    use std::io::Cursor;
+
+    let bytes = std::fs::read(path).ok()?;
+    let reader = ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()?;
+    let img = reader.decode().ok()?;
+
+    let width = img.width();
+    let height = img.height();
+
+    let data = match img {
+        DynamicImage::ImageLuma8(img) => TextureData::RU8(img.into_raw()),
+        DynamicImage::ImageLumaA8(img) => {
+            let raw = img.into_raw();
+            TextureData::RgU8(raw.chunks(2).map(|c| [c[0], c[1]]).collect())
+        }
+        DynamicImage::ImageRgb8(img) => {
+            let raw = img.into_raw();
+            TextureData::RgbU8(raw.chunks(3).map(|c| [c[0], c[1], c[2]]).collect())
+        }
+        DynamicImage::ImageRgba8(img) => {
+            let raw = img.into_raw();
+            TextureData::RgbaU8(raw.chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect())
+        }
+        other => {
+            let img = other.to_rgba8();
+            let raw = img.into_raw();
+            TextureData::RgbaU8(raw.chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect())
+        }
+    };
+
+    Some(CpuTexture {
+        data,
+        width,
+        height,
+        ..Default::default()
+    })
+}
+
+/// Clean USD asset path by removing @ wrappers and normalizing path separators.
+fn clean_asset_path(path: &str) -> String {
+    let path = path.trim();
+    // Remove @ wrappers (USD asset path syntax)
+    let path = path.trim_matches('@');
+    // Remove ./ prefix if present
+    let path = path.strip_prefix("./").unwrap_or(path);
+    // Normalize path separators for cross-platform compatibility
+    path.replace('\\', "/")
 }
 
 /// Create scene from meshes.
@@ -986,47 +1114,21 @@ fn create_scene(
                 cpu_mesh.compute_normals();
             }
 
-            // Add UVs if available
+            // Add UVs if available (already expanded for face-varying at extraction time)
             if let Some(ref uv_data) = mesh.uvs {
-                let vertex_count = mesh.positions.len() / 3;
-                let uv_count = uv_data.len() / 2;
-
-                // Check if UVs match vertex count (vertex interpolation)
-                if uv_count == vertex_count {
-                    let uvs: Vec<Vec2> = uv_data
-                        .chunks(2)
-                        .map(|c| vec2(c[0], 1.0 - c[1])) // Flip V for OpenGL convention
-                        .collect();
-                    cpu_mesh.uvs = Some(uvs);
-                } else if let Some(ref uv_idx) = mesh.uv_indices {
-                    // FaceVarying UVs with indices - expand to match indexed vertices
-                    // The UV indices reference into the UV array, and should align with face vertex indices
-                    if let Some(ref mesh_indices) = mesh.indices {
-                        // Create per-vertex UVs by mapping through indices
-                        let mut vertex_uvs = vec![vec2(0.0, 0.0); vertex_count];
-                        for (face_vert_idx, &uv_idx_val) in uv_idx.iter().enumerate() {
-                            if face_vert_idx < mesh_indices.len() {
-                                let vertex_idx = mesh_indices[face_vert_idx] as usize;
-                                let uv_idx_usize = uv_idx_val as usize;
-                                if vertex_idx < vertex_count && uv_idx_usize * 2 + 1 < uv_data.len()
-                                {
-                                    let u = uv_data[uv_idx_usize * 2];
-                                    let v = 1.0 - uv_data[uv_idx_usize * 2 + 1];
-                                    vertex_uvs[vertex_idx] = vec2(u, v);
-                                }
-                            }
-                        }
-                        cpu_mesh.uvs = Some(vertex_uvs);
-                    }
-                }
+                let uvs: Vec<Vec2> = uv_data
+                    .chunks(2)
+                    .map(|c| vec2(c[0], 1.0 - c[1])) // Flip V for OpenGL convention
+                    .collect();
+                cpu_mesh.uvs = Some(uvs);
             }
 
             let cpu_material = if let Some(ref usd_mat) = mesh.material {
                 let albedo_texture = if show_textures {
                     if let Some(ref tex_path) = usd_mat.diffuse_texture {
-                        let clean_path = tex_path.trim_matches('@');
+                        let clean_path = clean_asset_path(tex_path);
                         if let Some(dir) = base_dir {
-                            let full_path = dir.join(clean_path);
+                            let full_path = dir.join(&clean_path);
                             load_texture(&full_path)
                         } else {
                             None
