@@ -1,50 +1,60 @@
 # PowerUSD
 
-Fast USD asset browser and viewer built in pure Rust with 3dsmax and blender scripts to quickly export assets in USD.
+Fast USD asset browser and viewer built in pure Rust. Includes batch exporters for 3ds Max and Blender.
 
 ## Why?
 
-Current 3d asset library software are:
+Current 3D asset library software are:
 - Too slow
 - Bloated
 - Subscription services
-- Don't even have 3d viewer.
-- No USD support.
+- Don't even have 3D viewer
+- No USD support
 
-
-Comes with Max and Blender script for auto thumbnailing and batch processing to convert existing assets to .USD quickly because these 3d asset companies be handing out ".blend" ".max" (3 different renderer versions) or FBX (even worse) like crazy.
-
-Advanced library functions like asset tagging will be added soon inshallah. 
+Comes with DCC exporters for batch processing and quick USD conversion. Stop dealing with ".blend", ".max" (3 different renderer versions), or FBX files.
 
 ## Interface
+
 ![Alt text](images/PowerUSD.png)
 
-- **Asset Library Browser** - Press SPACE to toggle
-  - Grid and list view modes
-  - Thumbnail support (user-provided JPG/PNG)
-  - Fast directory scanning
-  - Search functionality
-  - Custom library paths
-  - USDPreviewSurface (color channel only, full pbr in future)
-  - Efficent and multithreaded texture loading/resizing.
+### Asset Library Browser (SPACE to toggle)
+- Grid and list view modes
+- Thumbnail support (JPG/PNG next to USD files)
+- Fast directory scanning with search
+- Persistent library paths (saved to config)
 
-- **3D Viewer**
-  - USD/USDC support
-  - Drag & drop file loading
-  - Orbit camera controls
-  - Z-up to Y-up conversion (3ds Max support)
+### 3D Viewer
+- USD/USDA/USDC support
+- Drag & drop file loading
+- Orbit camera controls
+- Z-up to Y-up conversion (3ds Max support)
+- UsdPreviewSurface and MaterialX materials
+- Multi-material mesh support (GeomSubsets)
+- Multithreaded texture loading/resizing
 
-- **Scene Inspector**
-  - Hierarchy browser
-  - Property inspector
+### PBR & Debug Shading
+- **Load Color Channel** - Diffuse textures only (fast preview)
+- **Load Full PBR** - Full UsdPreviewSurface (diffuse, normal, occlusion, emissive)
+- Click again to unload textures and free memory
+- **Debug Shading** - Toggle individual maps, adjust material values
+- **Environment Maps** - Load HDR/EXR for IBL lighting
 
-## Dependencies
+### Scene Inspector
+- Hierarchy browser
+- Property inspector
 
-- [openusd](https://github.com/mxpv/openusd) - Pure Rust USD parser
-- [three-d](https://github.com/asny/three-d) - 3D rendering engine
-- [egui](https://github.com/emilk/egui) - Immediate mode GUI
-- [winit](https://github.com/rust-windowing/winit) - Window handling
-- [arboard](https://github.com/1Password/arboard) - Clipboard support
+## DCC Exporters
+
+Batch USD exporters included in `dcc-exporters/`:
+
+### 3ds Max
+- `powerusd.ms` - Batch exporter with layer/hierarchy/selection set modes
+- USD chasers for UE-compatible UsdPreviewSurface materials
+
+### Blender
+- `Clone_PowerUSD` addon - One-click batch USD export
+
+See [dcc-exporters/README.md](dcc-exporters/README.md) for installation.
 
 ## Thumbnails
 
@@ -68,11 +78,11 @@ cargo build --release
 - **Scroll** - Zoom
 - **Drag & Drop** - Load USD file
 
+## Dependencies
 
-## Issues
-Blender USD files load materials fine. 3dsmax don't. Autodesk's USD exporter is a mess. Trying to figure it out.
-
-
+- [openusd](https://github.com/mxpv/openusd) - Pure Rust USD parser
+- [three-d](https://github.com/asny/three-d) - 3D rendering engine
+- [egui](https://github.com/emilk/egui) - Immediate mode GUI
 
 ## License
 
