@@ -1,10 +1,10 @@
 [package]
 name = "powerusd"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
 description = "Fast USD asset browser and viewer"
 license = "MIT"
-repository = "https://github.com/paxsethux/powerusd"
+repository = "https://github.com/cl0nazepamm/powerusd/"
 keywords = ["usd", "openusd", "3d", "asset-browser", "viewer"]
 categories = ["graphics", "rendering", "visualization"]
 
