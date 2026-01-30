@@ -46,7 +46,7 @@ One-click batch USD export for digital content creation applications, with built
 
 | Script | Description |
 |--------|-------------|
-| `Clone_USD_CleanStruct.py` | Fixes "nodegraph" mess caused by maxusd. |
+| `Clone_USD_CleanStruct.py` | Fixes UsdPreviewSurface connections for Unreal Engine by bypassing NodeGraphs. |
 | `Clone_USD_usdWrapper` | Wraps meshes under xform (experimental) |
 
 ### Export Modes
