@@ -5,3 +5,17 @@ Cargo.lock
 .vs/
 .vscode/
 *.log
+
+# Python (DCC exporters)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Blender
+*.blend1
+*.blend2
+
+# 3ds Max
+*.bak
+Thumbs.db
+Desktop.ini
