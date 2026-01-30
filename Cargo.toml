@@ -18,6 +18,7 @@ image = "0.25"
 rayon = "1.7"
 arboard = "3"
 quick-xml = "0.37"
+rfd = "0.15"
 
 [profile.release]
 lto = true

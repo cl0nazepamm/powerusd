@@ -1,6 +1,20 @@
 # PowerUSD
 
-Fast USD asset browser and viewer built in pure Rust.
+Fast USD asset browser and viewer built in pure Rust with 3dsmax and blender scripts to quickly export assets in USD.
+
+## Why?
+
+Current 3d asset library software are:
+- Too slow
+- Bloated
+- Subscription services
+- Don't even have 3d viewer.
+- No USD support.
+
+
+Comes with Max and Blender script for auto thumbnailing and batch processing to convert existing assets to .USD quickly because these 3d asset companies be handing out ".blend" ".max" (3 different renderer versions) or FBX (even worse) like crazy.
+
+Advanced library functions like asset tagging will be added soon inshallah. 
 
 ## Interface
 ![Alt text](images/PowerUSD.png)

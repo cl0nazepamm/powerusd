@@ -665,6 +665,12 @@ struct Scene {
     size: f32,
 }
 
+/// Environment map state for IBL lighting.
+struct EnvironmentMap {
+    skybox: Skybox,
+    light: AmbientLight,
+}
+
 /// Get a property value from a prim, handling both static and time-sampled data.
 fn get_property(
     data: &mut dyn AbstractData,
@@ -795,6 +801,7 @@ fn get_local_transform(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> Ma
 }
 
 /// Triangulate polygon mesh indices using fan triangulation.
+#[allow(dead_code)]
 fn triangulate_faces(face_vertex_counts: &[i32], face_vertex_indices: &[i32]) -> Vec<u32> {
     // Pre-calculate capacity to avoid reallocations
     let triangle_count: usize = face_vertex_counts
@@ -1010,24 +1017,87 @@ fn get_mesh_material(
     })
 }
 
+/// GeomSubset info for multi-material meshes.
+struct GeomSubset {
+    #[allow(dead_code)]
+    name: String,
+    face_indices: Vec<i32>,
+    material: Option<UsdPreviewSurface>,
+}
+
+/// Find GeomSubset children under a mesh for multi-material support.
+fn find_geom_subsets(data: &mut dyn AbstractData, mesh_path: &sdf::Path) -> Vec<GeomSubset> {
+    let mut subsets = Vec::new();
+
+    let children = match data.get(mesh_path, "primChildren") {
+        Ok(val) => val.into_owned().try_as_token_vec().unwrap_or_default(),
+        Err(_) => return subsets,
+    };
+
+    let mesh_str = mesh_path.as_str();
+
+    for child_name in children {
+        let child_path = match sdf::path(format!("{}/{}", mesh_str, child_name)) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Check if this is a GeomSubset by looking for "indices" property
+        let indices = match get_property(data, &child_path, "indices") {
+            Some(val) => val.try_as_int_vec().unwrap_or_default(),
+            None => continue,
+        };
+
+        if indices.is_empty() {
+            continue;
+        }
+
+        // Get material binding for this subset
+        let material = get_mesh_material(data, &child_path);
+
+        subsets.push(GeomSubset {
+            name: child_name,
+            face_indices: indices,
+            material,
+        });
+    }
+
+    subsets
+}
+
 /// Try to extract mesh data from a single prim path.
-fn try_extract_mesh(
+/// Returns multiple meshes if the mesh has GeomSubsets (multi-material).
+fn try_extract_meshes(
     data: &mut dyn AbstractData,
     path: &sdf::Path,
     name: &str,
     world_transform: Matrix4,
-) -> Option<UsdMesh> {
-    let points = get_property(data, path, "points")?;
-    let positions: Vec<f32> = points
+) -> Vec<UsdMesh> {
+    let points = match get_property(data, path, "points") {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let positions: Vec<f32> = match points
         .clone()
         .try_as_vec_3f()
-        .or_else(|| points.try_as_float_vec())?;
+        .or_else(|| points.try_as_float_vec())
+    {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
 
     if positions.is_empty() {
-        return None;
+        return Vec::new();
     }
 
-    let normals = get_property(data, path, "normals").and_then(|v| v.try_as_vec_3f());
+    // Try multiple normal property names (3ds Max uses primvars:normals)
+    let normals = get_property(data, path, "normals")
+        .or_else(|| get_property(data, path, "primvars:normals"))
+        .and_then(|v| v.try_as_vec_3f());
+
+    // Get normal indices for face-varying interpolation
+    let normal_indices = get_property(data, path, "primvars:normals:indices")
+        .and_then(|v| v.try_as_int_vec());
 
     // Try to get UVs from common primvar names
     let raw_uvs = get_property(data, path, "primvars:st")
@@ -1048,117 +1118,189 @@ fn try_extract_mesh(
     let face_vertex_indices =
         get_property(data, path, "faceVertexIndices").and_then(|v| v.try_as_int_vec());
 
-    // Try to get material
-    let material = get_mesh_material(data, path);
+    // Check for GeomSubsets (multi-material)
+    let subsets = find_geom_subsets(data, path);
 
-    // Determine if we need to expand the mesh for face-varying UVs
+    // Fallback material from mesh itself
+    let mesh_material = get_mesh_material(data, path);
+
+    // Determine if we need to expand the mesh for face-varying attributes
     let vertex_count = positions.len() / 3;
     let uv_count = raw_uvs.as_ref().map(|u| u.len() / 2).unwrap_or(0);
+    let normal_count = normals.as_ref().map(|n| n.len() / 3).unwrap_or(0);
     let face_vert_count = face_vertex_indices.as_ref().map(|f| f.len()).unwrap_or(0);
 
-    // Check if UVs are face-varying (count matches face vertices, not positions)
+    // Check if UVs are face-varying
     let uvs_are_face_varying = uv_count > 0
         && uv_count != vertex_count
         && (uv_count == face_vert_count || uv_indices.is_some());
 
-    if uvs_are_face_varying {
-        // Expand mesh: each face-vertex becomes a unique vertex
-        if let (Some(counts), Some(fv_indices)) = (&face_vertex_counts, &face_vertex_indices) {
-            let raw_uvs = raw_uvs.unwrap();
+    // Check if normals are face-varying
+    let normals_are_face_varying = normal_count > 0
+        && normal_count != vertex_count
+        && (normal_count == face_vert_count || normal_indices.is_some());
 
-            // Triangulate and expand in one pass
-            let mut expanded_positions = Vec::new();
-            let mut expanded_normals: Option<Vec<f32>> = normals.as_ref().map(|_| Vec::new());
-            let mut expanded_uvs = Vec::new();
-            let mut expanded_indices = Vec::new();
+    // Build expanded mesh data with face tracking for subset splitting
+    if let (Some(counts), Some(fv_indices)) = (&face_vertex_counts, &face_vertex_indices) {
+        // Triangulate and expand, tracking which face each triangle belongs to
+        let mut expanded_positions = Vec::new();
+        let mut expanded_normals: Option<Vec<f32>> = normals.as_ref().map(|_| Vec::new());
+        let mut expanded_uvs: Option<Vec<f32>> = raw_uvs.as_ref().map(|_| Vec::new());
+        let mut triangle_face_indices: Vec<i32> = Vec::new(); // Which original face each triangle came from
 
-            let mut fv_offset = 0usize;
-            let mut out_idx = 0u32;
+        let mut fv_offset = 0usize;
 
-            for &count in counts {
-                let count = count as usize;
-                if count < 3 {
-                    fv_offset += count;
-                    continue;
-                }
+        for (face_idx, &count) in counts.iter().enumerate() {
+            let count = count as usize;
+            if count < 3 {
+                fv_offset += count;
+                continue;
+            }
 
-                // Fan triangulation: (0, 1, 2), (0, 2, 3), (0, 3, 4), ...
-                for i in 1..(count - 1) {
-                    let tri_fv = [fv_offset, fv_offset + i, fv_offset + i + 1];
+            // Fan triangulation: (0, 1, 2), (0, 2, 3), (0, 3, 4), ...
+            for i in 1..(count - 1) {
+                let tri_fv = [fv_offset, fv_offset + i, fv_offset + i + 1];
+                triangle_face_indices.push(face_idx as i32);
 
-                    for &fv_idx in &tri_fv {
-                        // Get vertex index from face-vertex index
-                        let vert_idx = fv_indices[fv_idx] as usize;
+                for &fv_idx in &tri_fv {
+                    let vert_idx = fv_indices[fv_idx] as usize;
 
-                        // Expand position
-                        expanded_positions.push(positions[vert_idx * 3]);
-                        expanded_positions.push(positions[vert_idx * 3 + 1]);
-                        expanded_positions.push(positions[vert_idx * 3 + 2]);
+                    // Expand position
+                    expanded_positions.push(positions[vert_idx * 3]);
+                    expanded_positions.push(positions[vert_idx * 3 + 1]);
+                    expanded_positions.push(positions[vert_idx * 3 + 2]);
 
-                        // Expand normals if present
-                        if let (Some(ref n), Some(ref mut en)) = (&normals, &mut expanded_normals) {
-                            // Normals might be per-vertex or per-face-vertex
-                            if n.len() / 3 == vertex_count {
-                                en.push(n[vert_idx * 3]);
-                                en.push(n[vert_idx * 3 + 1]);
-                                en.push(n[vert_idx * 3 + 2]);
-                            } else if n.len() / 3 >= face_vert_count {
-                                en.push(n[fv_idx * 3]);
-                                en.push(n[fv_idx * 3 + 1]);
-                                en.push(n[fv_idx * 3 + 2]);
-                            }
-                        }
-
-                        // Expand UVs
-                        let uv_idx = if let Some(ref uv_idx_array) = uv_indices {
-                            uv_idx_array[fv_idx] as usize
+                    // Expand normals if present
+                    if let (Some(ref n), Some(ref mut en)) = (&normals, &mut expanded_normals) {
+                        let n_idx = if let Some(ref ni) = normal_indices {
+                            ni.get(fv_idx).copied().unwrap_or(0) as usize
+                        } else if !normals_are_face_varying {
+                            vert_idx
                         } else {
                             fv_idx
                         };
-                        if uv_idx * 2 + 1 < raw_uvs.len() {
-                            expanded_uvs.push(raw_uvs[uv_idx * 2]);
-                            expanded_uvs.push(raw_uvs[uv_idx * 2 + 1]);
-                        } else {
-                            expanded_uvs.push(0.0);
-                            expanded_uvs.push(0.0);
-                        }
 
-                        expanded_indices.push(out_idx);
-                        out_idx += 1;
+                        if n_idx * 3 + 2 < n.len() {
+                            en.push(n[n_idx * 3]);
+                            en.push(n[n_idx * 3 + 1]);
+                            en.push(n[n_idx * 3 + 2]);
+                        } else {
+                            let fallback_idx = fv_idx.min(n.len() / 3 - 1);
+                            en.push(n[fallback_idx * 3]);
+                            en.push(n[fallback_idx * 3 + 1]);
+                            en.push(n[fallback_idx * 3 + 2]);
+                        }
+                    }
+
+                    // Expand UVs if present
+                    if let (Some(ref uvs), Some(ref mut eu)) = (&raw_uvs, &mut expanded_uvs) {
+                        let uv_idx = if let Some(ref uv_idx_array) = uv_indices {
+                            uv_idx_array.get(fv_idx).copied().unwrap_or(0) as usize
+                        } else if uvs_are_face_varying {
+                            fv_idx
+                        } else {
+                            vert_idx
+                        };
+
+                        if uv_idx * 2 + 1 < uvs.len() {
+                            eu.push(uvs[uv_idx * 2]);
+                            eu.push(uvs[uv_idx * 2 + 1]);
+                        } else {
+                            eu.push(0.0);
+                            eu.push(0.0);
+                        }
                     }
                 }
-                fv_offset += count;
             }
+            fv_offset += count;
+        }
 
-            return Some(UsdMesh {
+        // Now split by subsets if present
+        if subsets.is_empty() {
+            // No subsets - return single mesh
+            let indices: Vec<u32> = (0..expanded_positions.len() as u32 / 3).collect();
+            return vec![UsdMesh {
                 path: path.clone(),
                 name: name.to_string(),
                 positions: expanded_positions,
                 normals: expanded_normals,
-                uvs: Some(expanded_uvs),
-                indices: Some(expanded_indices),
-                material,
+                uvs: expanded_uvs,
+                indices: Some(indices),
+                material: mesh_material,
                 world_transform,
-            });
+            }];
         }
+
+        // Split mesh by GeomSubsets
+        let mut result_meshes = Vec::new();
+        use std::collections::HashSet;
+
+        for (subset_idx, subset) in subsets.iter().enumerate() {
+            let face_set: HashSet<i32> = subset.face_indices.iter().copied().collect();
+
+            let mut sub_positions = Vec::new();
+            let mut sub_normals: Option<Vec<f32>> = expanded_normals.as_ref().map(|_| Vec::new());
+            let mut sub_uvs: Option<Vec<f32>> = expanded_uvs.as_ref().map(|_| Vec::new());
+            let mut sub_indices = Vec::new();
+
+            for (tri_idx, &face_idx) in triangle_face_indices.iter().enumerate() {
+                if !face_set.contains(&face_idx) {
+                    continue;
+                }
+
+                // Copy this triangle's vertices
+                let base_vert = tri_idx * 3;
+                for v in 0..3 {
+                    let src_idx = base_vert + v;
+                    let new_idx = sub_positions.len() / 3;
+
+                    sub_positions.push(expanded_positions[src_idx * 3]);
+                    sub_positions.push(expanded_positions[src_idx * 3 + 1]);
+                    sub_positions.push(expanded_positions[src_idx * 3 + 2]);
+
+                    if let (Some(ref en), Some(ref mut sn)) = (&expanded_normals, &mut sub_normals) {
+                        sn.push(en[src_idx * 3]);
+                        sn.push(en[src_idx * 3 + 1]);
+                        sn.push(en[src_idx * 3 + 2]);
+                    }
+
+                    if let (Some(ref eu), Some(ref mut su)) = (&expanded_uvs, &mut sub_uvs) {
+                        su.push(eu[src_idx * 2]);
+                        su.push(eu[src_idx * 2 + 1]);
+                    }
+
+                    sub_indices.push(new_idx as u32);
+                }
+            }
+
+            if !sub_positions.is_empty() {
+                result_meshes.push(UsdMesh {
+                    path: path.clone(),
+                    name: format!("{}_{}", name, subset_idx),
+                    positions: sub_positions,
+                    normals: sub_normals,
+                    uvs: sub_uvs,
+                    indices: Some(sub_indices),
+                    material: subset.material.clone().or_else(|| mesh_material.clone()),
+                    world_transform,
+                });
+            }
+        }
+
+        return result_meshes;
     }
 
-    // Standard path: vertex-interpolated UVs or no UVs
-    let indices = match (face_vertex_counts, face_vertex_indices) {
-        (Some(counts), Some(indices)) => Some(triangulate_faces(&counts, &indices)),
-        _ => None,
-    };
-
-    Some(UsdMesh {
+    // Fallback: no face data, return simple mesh
+    vec![UsdMesh {
         path: path.clone(),
         name: name.to_string(),
         positions,
         normals,
         uvs: raw_uvs,
-        indices,
-        material,
+        indices: None,
+        material: mesh_material,
         world_transform,
-    })
+    }]
 }
 
 /// Extract meshes from USD data recursively, accumulating transforms.
@@ -1187,9 +1329,9 @@ fn extract_meshes_recursive(
         let local_transform = get_local_transform(data, &child_path);
         let world_transform = parent_transform.mul(&local_transform);
 
-        if let Some(mesh) = try_extract_mesh(data, &child_path, &child_name, world_transform) {
-            meshes.push(mesh);
-        }
+        // Extract meshes (may return multiple for multi-material meshes)
+        let extracted = try_extract_meshes(data, &child_path, &child_name, world_transform);
+        meshes.extend(extracted);
         meshes.extend(extract_meshes_recursive(
             data,
             &child_path,
@@ -1286,6 +1428,57 @@ fn transform_z_to_y(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
 /// Maximum texture size to prevent memory/VRAM issues with production assets.
 const MAX_TEXTURE_SIZE: u32 = 512;
 
+/// Maximum environment map size for performance.
+const MAX_ENV_SIZE: u32 = 2048;
+
+/// Load an environment map (HDR or LDR) into a CpuTexture.
+/// Supports .hdr (Radiance), .exr, and standard image formats.
+fn load_environment_texture(path: &Path) -> Option<CpuTexture> {
+    use image::{imageops::FilterType, DynamicImage, ImageReader};
+    use std::io::Cursor;
+
+    let bytes = std::fs::read(path).ok()?;
+    let reader = ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()?;
+    let img = reader.decode().ok()?;
+
+    // Resize if too large
+    let img = if img.width() > MAX_ENV_SIZE || img.height() > MAX_ENV_SIZE {
+        img.resize(MAX_ENV_SIZE, MAX_ENV_SIZE, FilterType::Triangle)
+    } else {
+        img
+    };
+
+    let width = img.width();
+    let height = img.height();
+
+    // For HDR/environment maps, prefer float data if available
+    let data = match img {
+        DynamicImage::ImageRgb32F(img) => {
+            let raw = img.into_raw();
+            TextureData::RgbF32(raw.chunks(3).map(|c| [c[0], c[1], c[2]]).collect())
+        }
+        DynamicImage::ImageRgba32F(img) => {
+            let raw = img.into_raw();
+            TextureData::RgbaF32(raw.chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect())
+        }
+        other => {
+            // Convert to RGB for LDR environment maps
+            let img = other.to_rgb8();
+            let raw = img.into_raw();
+            TextureData::RgbU8(raw.chunks(3).map(|c| [c[0], c[1], c[2]]).collect())
+        }
+    };
+
+    Some(CpuTexture {
+        data,
+        width,
+        height,
+        ..Default::default()
+    })
+}
+
 /// Load a texture from disk into a CpuTexture.
 /// Resizes to MAX_TEXTURE_SIZE to prevent memory/VRAM issues with large textures.
 fn load_texture(path: &Path) -> Option<CpuTexture> {
@@ -1356,7 +1549,7 @@ fn create_scene(
     context: &Context,
     meshes: &[UsdMesh],
     up_axis: UpAxis,
-    show_textures: bool,
+    texture_mode: TextureMode,
     base_dir: Option<&Path>,
 ) -> Scene {
     let needs_transform = up_axis == UpAxis::Z;
@@ -1494,9 +1687,6 @@ fn create_scene(
             let cpu_material = if let Some(ref usd_mat) = mesh.material {
                 // Helper to load texture from USD path
                 let load_tex = |tex_opt: &Option<String>| -> Option<CpuTexture> {
-                    if !show_textures {
-                        return None;
-                    }
                     tex_opt.as_ref().and_then(|tex_path| {
                         let clean_path = clean_asset_path(tex_path);
                         base_dir
@@ -1505,13 +1695,39 @@ fn create_scene(
                     })
                 };
 
-                // Only load diffuse texture for now to save memory
-                // TODO: Enable full PBR textures when memory management is improved
-                let albedo_texture = load_tex(&usd_mat.diffuse_texture);
+                // Load textures based on texture mode
+                let (albedo_texture, normal_texture, occlusion_texture, emissive_texture) =
+                    match texture_mode {
+                        TextureMode::None => (None, None, None, None),
+                        TextureMode::ColorOnly => {
+                            (load_tex(&usd_mat.diffuse_texture), None, None, None)
+                        }
+                        TextureMode::FullPbr => {
+                            // Full UsdPreviewSurface spec
+                            // NOTE: Metallic/roughness textures are NOT loaded because three-d
+                            // expects a combined texture (G=roughness, B=metallic) but USD has separate.
+                            // We use the scalar values from USD instead.
+                            (
+                                load_tex(&usd_mat.diffuse_texture),
+                                load_tex(&usd_mat.normal_texture),
+                                load_tex(&usd_mat.occlusion_texture),
+                                load_tex(&usd_mat.emissive_texture),
+                            )
+                        }
+                    };
+
+                // Compute tangents if normal map is used (required for tangent-space normal mapping)
+                if normal_texture.is_some()
+                    && cpu_mesh.normals.is_some()
+                    && cpu_mesh.uvs.is_some()
+                {
+                    cpu_mesh.compute_tangents();
+                }
+
+                // Metallic/roughness use scalar values only (no texture)
+                // three-d expects combined metallic_roughness_texture (G=roughness, B=metallic)
+                // but USD has separate textures that can't be combined without preprocessing.
                 let metallic_roughness_texture: Option<CpuTexture> = None;
-                let normal_texture: Option<CpuTexture> = None;
-                let occlusion_texture: Option<CpuTexture> = None;
-                let emissive_texture: Option<CpuTexture> = None;
 
                 let to_srgb = |c: f32| -> u8 { (c.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8 };
                 let albedo = Srgba::new(
@@ -1586,22 +1802,132 @@ fn create_scene(
     }
 }
 
+/// Texture loading mode for scene creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TextureMode {
+    /// No textures loaded.
+    #[default]
+    None,
+    /// Only diffuse/albedo color texture.
+    ColorOnly,
+    /// Full PBR: diffuse, metallic, roughness, normal, occlusion, emissive.
+    FullPbr,
+}
+
+/// Debug shading settings for material inspection.
+#[derive(Debug, Clone)]
+struct DebugShading {
+    enabled: bool,
+    // Map toggles (true = use texture, false = use slider value)
+    use_diffuse_map: bool,
+    use_metallic_map: bool,
+    use_roughness_map: bool,
+    use_normal_map: bool,
+    use_occlusion_map: bool,
+    use_emissive_map: bool,
+    // Override values
+    diffuse_color: [f32; 3],
+    metallic: f32,
+    specular: f32,
+    roughness: f32,
+    emissive_color: [f32; 3],
+    opacity: f32,
+}
+
+impl Default for DebugShading {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            use_diffuse_map: true,
+            use_metallic_map: true,
+            use_roughness_map: true,
+            use_normal_map: true,
+            use_occlusion_map: true,
+            use_emissive_map: true,
+            diffuse_color: [0.8, 0.8, 0.8],
+            metallic: 0.0,
+            specular: 0.5,
+            roughness: 0.5,
+            emissive_color: [0.0, 0.0, 0.0],
+            opacity: 1.0,
+        }
+    }
+}
+
+/// Cached original material values for non-destructive debug shading.
+#[derive(Clone)]
+struct MaterialCache {
+    albedo: Srgba,
+    albedo_texture: Option<Texture2DRef>,
+    metallic: f32,
+    roughness: f32,
+    metallic_roughness_texture: Option<Texture2DRef>,
+    normal_texture: Option<Texture2DRef>,
+    occlusion_texture: Option<Texture2DRef>,
+    emissive: Srgba,
+    emissive_texture: Option<Texture2DRef>,
+}
+
+impl MaterialCache {
+    fn from_material(mat: &PhysicalMaterial) -> Self {
+        Self {
+            albedo: mat.albedo,
+            albedo_texture: mat.albedo_texture.clone(),
+            metallic: mat.metallic,
+            roughness: mat.roughness,
+            metallic_roughness_texture: mat.metallic_roughness_texture.clone(),
+            normal_texture: mat.normal_texture.clone(),
+            occlusion_texture: mat.occlusion_texture.clone(),
+            emissive: mat.emissive,
+            emissive_texture: mat.emissive_texture.clone(),
+        }
+    }
+
+    fn restore_to_material(&self, mat: &mut PhysicalMaterial) {
+        mat.albedo = self.albedo;
+        mat.albedo_texture = self.albedo_texture.clone();
+        mat.metallic = self.metallic;
+        mat.roughness = self.roughness;
+        mat.metallic_roughness_texture = self.metallic_roughness_texture.clone();
+        mat.normal_texture = self.normal_texture.clone();
+        mat.occlusion_texture = self.occlusion_texture.clone();
+        mat.emissive = self.emissive;
+        mat.emissive_texture = self.emissive_texture.clone();
+    }
+}
+
 struct AppState {
     stage: Option<Box<dyn AbstractData>>,
     scene: Scene,
     selected_path: Option<sdf::Path>,
     hierarchy_cache: Option<HierarchyNode>,
     inspector_cache: InspectorCache,
-    show_textures: bool,
+    texture_mode: TextureMode,
     meshes: Vec<UsdMesh>, // Keep meshes to rebuild scene
     base_dir: Option<PathBuf>,
     up_axis: UpAxis,
     asset_library: AssetLibrary,
     // Rendering options
     use_environment: bool,
-    metallic_override: f32,
-    roughness_override: f32,
-    use_material_overrides: bool,
+    environment_map: Option<EnvironmentMap>,
+    environment_path: Option<PathBuf>,
+    debug_shading: DebugShading,
+    /// Cached original material values for non-destructive debug shading.
+    material_cache: Vec<MaterialCache>,
+    /// Track if debug shading was enabled last frame to detect changes.
+    debug_shading_was_enabled: bool,
+}
+
+/// Load an environment map from an image file.
+fn load_environment_map(context: &Context, path: &Path) -> Option<EnvironmentMap> {
+    println!("Loading environment map: {}", path.display());
+
+    let cpu_texture = load_environment_texture(path)?;
+    let skybox = Skybox::new_from_equirectangular(context, &cpu_texture);
+    let light = AmbientLight::new_with_environment(context, 1.0, Srgba::WHITE, skybox.texture());
+
+    println!("Environment map loaded successfully");
+    Some(EnvironmentMap { skybox, light })
 }
 
 /// Load a USD file and update application state.
@@ -1645,7 +1971,7 @@ fn load_usd_file(
                 context,
                 &meshes,
                 up_axis,
-                state.show_textures,
+                state.texture_mode,
                 dir.as_deref(),
             );
             state.stage = Some(new_stage);
@@ -1655,6 +1981,8 @@ fn load_usd_file(
             state.meshes = meshes;
             state.base_dir = dir;
             state.up_axis = up_axis;
+            state.material_cache.clear();
+            state.debug_shading_was_enabled = false;
             *prev_selected = None;
 
             let camera_distance = state.scene.size * 2.0;
@@ -1767,19 +2095,21 @@ fn main() {
 
     let mut state = AppState {
         stage,
-        scene: create_scene(&context, &meshes, up_axis, false, base_dir.as_deref()),
+        scene: create_scene(&context, &meshes, up_axis, TextureMode::None, base_dir.as_deref()),
         selected_path: None,
         hierarchy_cache,
         inspector_cache: InspectorCache::default(),
-        show_textures: false,
+        texture_mode: TextureMode::None,
         meshes,
         base_dir,
         up_axis,
         asset_library: AssetLibrary::default(),
         use_environment: false,
-        metallic_override: 0.0,
-        roughness_override: 0.5,
-        use_material_overrides: false,
+        environment_map: None,
+        environment_path: None,
+        debug_shading: DebugShading::default(),
+        material_cache: Vec::new(),
+        debug_shading_was_enabled: false,
     };
 
     // Near/far planes scaled to scene size to avoid z-fighting
@@ -1918,43 +2248,141 @@ fn main() {
 
                                 ui.separator();
 
-                                if ui
-                                    .checkbox(&mut state.show_textures, "Show Textures")
-                                    .clicked()
-                                {
-                                    // Rebuild scene when toggle changes
+                                // Texture loading buttons (click again to unload and free memory)
+                                let color_selected = state.texture_mode == TextureMode::ColorOnly;
+                                if ui.selectable_label(color_selected, "Load Color Channel").clicked() {
+                                    // Toggle: if already selected, switch to None to unload textures
+                                    state.texture_mode = if color_selected {
+                                        TextureMode::None
+                                    } else {
+                                        TextureMode::ColorOnly
+                                    };
                                     state.scene = create_scene(
                                         &context,
                                         &state.meshes,
                                         state.up_axis,
-                                        state.show_textures,
+                                        state.texture_mode,
                                         state.base_dir.as_deref(),
                                     );
+                                    state.material_cache.clear();
+                                    state.debug_shading_was_enabled = false;
                                 }
 
-                                ui.checkbox(&mut state.use_environment, "Environment Light");
+                                let pbr_selected = state.texture_mode == TextureMode::FullPbr;
+                                if ui.selectable_label(pbr_selected, "Load Full PBR").clicked() {
+                                    // Toggle: if already selected, switch to None to unload textures
+                                    state.texture_mode = if pbr_selected {
+                                        TextureMode::None
+                                    } else {
+                                        TextureMode::FullPbr
+                                    };
+                                    state.scene = create_scene(
+                                        &context,
+                                        &state.meshes,
+                                        state.up_axis,
+                                        state.texture_mode,
+                                        state.base_dir.as_deref(),
+                                    );
+                                    state.material_cache.clear();
+                                    state.debug_shading_was_enabled = false;
+                                }
 
                                 ui.separator();
 
-                                ui.checkbox(
-                                    &mut state.use_material_overrides,
-                                    "Material Overrides",
-                                );
-                                if state.use_material_overrides {
-                                    ui.add(
-                                        egui::Slider::new(&mut state.metallic_override, 0.0..=1.0)
-                                            .text("Metallic"),
-                                    );
-                                    ui.add(
-                                        egui::Slider::new(&mut state.roughness_override, 0.0..=1.0)
-                                            .text("Roughness"),
-                                    );
+                                // Environment map controls
+                                let has_env = state.environment_map.is_some();
+                                let env_label = if has_env {
+                                    if let Some(ref p) = state.environment_path {
+                                        format!("Env: {}", p.file_name().unwrap_or_default().to_string_lossy())
+                                    } else {
+                                        "Environment".to_string()
+                                    }
+                                } else {
+                                    "Load Environment".to_string()
+                                };
+
+                                if ui.button(&env_label).clicked() {
+                                    // Open file dialog for environment map
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("HDR/Image", &["hdr", "exr", "png", "jpg", "jpeg"])
+                                        .pick_file()
+                                    {
+                                        if let Some(env) = load_environment_map(&context, &path) {
+                                            state.environment_map = Some(env);
+                                            state.environment_path = Some(path);
+                                            state.use_environment = true;
+                                        }
+                                    }
                                 }
+
+                                if has_env {
+                                    ui.checkbox(&mut state.use_environment, "Use Env");
+                                }
+
+                                ui.separator();
+
+                                ui.checkbox(&mut state.debug_shading.enabled, "Debug Shading");
 
                                 ui.separator();
                                 ui.label("Press SPACE for Asset Library");
                             });
                         });
+
+                        // Debug shading panel (right side, below inspector)
+                        if state.debug_shading.enabled {
+                            egui::Window::new("Debug Shading")
+                                .default_pos([gui_context.screen_rect().max.x - 280.0, 100.0])
+                                .default_width(260.0)
+                                .resizable(true)
+                                .show(gui_context, |ui| {
+                                    ui.heading("Map Toggles");
+                                    ui.checkbox(&mut state.debug_shading.use_diffuse_map, "Use Diffuse Map");
+                                    ui.checkbox(&mut state.debug_shading.use_metallic_map, "Use Metallic Map");
+                                    ui.checkbox(&mut state.debug_shading.use_roughness_map, "Use Roughness Map");
+                                    ui.checkbox(&mut state.debug_shading.use_normal_map, "Use Normal Map");
+                                    ui.checkbox(&mut state.debug_shading.use_occlusion_map, "Use Occlusion Map");
+                                    ui.checkbox(&mut state.debug_shading.use_emissive_map, "Use Emissive Map");
+
+                                    ui.separator();
+                                    ui.heading("Override Values");
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Diffuse:");
+                                        ui.color_edit_button_rgb(&mut state.debug_shading.diffuse_color);
+                                    });
+
+                                    ui.add(
+                                        egui::Slider::new(&mut state.debug_shading.metallic, 0.0..=1.0)
+                                            .text("Metallic"),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(&mut state.debug_shading.specular, 0.0..=1.0)
+                                            .text("Specular"),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(&mut state.debug_shading.roughness, 0.0..=1.0)
+                                            .text("Roughness"),
+                                    );
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Emissive:");
+                                        ui.color_edit_button_rgb(&mut state.debug_shading.emissive_color);
+                                    });
+
+                                    ui.add(
+                                        egui::Slider::new(&mut state.debug_shading.opacity, 0.0..=1.0)
+                                            .text("Opacity"),
+                                    );
+
+                                    ui.separator();
+                                    if ui.button("Reset to Defaults").clicked() {
+                                        state.debug_shading = DebugShading {
+                                            enabled: true,
+                                            ..Default::default()
+                                        };
+                                    }
+                                });
+                        }
 
                         // Asset library bottom panel with slide animation
                         egui::TopBottomPanel::bottom("asset_library")
@@ -2025,18 +2453,120 @@ fn main() {
                     }
                 }
 
-                // Apply material overrides if enabled
-                if state.use_material_overrides {
-                    for (_path, model) in state.scene.models.iter_mut() {
-                        model.material.metallic = state.metallic_override;
-                        model.material.roughness = state.roughness_override;
+                // Handle debug shading state changes
+                if state.debug_shading.enabled && !state.debug_shading_was_enabled {
+                    // Debug shading just enabled - cache current materials
+                    state.material_cache = state
+                        .scene
+                        .models
+                        .iter()
+                        .map(|(_, model)| MaterialCache::from_material(&model.material))
+                        .collect();
+                } else if !state.debug_shading.enabled && state.debug_shading_was_enabled {
+                    // Debug shading just disabled - restore materials from cache
+                    for (i, (_, model)) in state.scene.models.iter_mut().enumerate() {
+                        if let Some(cache) = state.material_cache.get(i) {
+                            cache.restore_to_material(&mut model.material);
+                        }
+                    }
+                }
+                state.debug_shading_was_enabled = state.debug_shading.enabled;
+
+                // Apply debug shading if enabled (non-destructive using cache)
+                if state.debug_shading.enabled {
+                    let to_srgb = |c: f32| -> u8 { (c.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8 };
+
+                    for (i, (_, model)) in state.scene.models.iter_mut().enumerate() {
+                        let cache = state.material_cache.get(i);
+
+                        // Restore from cache first, then apply overrides
+                        if let Some(c) = cache {
+                            // Diffuse/Albedo
+                            if state.debug_shading.use_diffuse_map {
+                                model.material.albedo_texture = c.albedo_texture.clone();
+                                model.material.albedo = c.albedo;
+                            } else {
+                                model.material.albedo_texture = None;
+                                model.material.albedo = Srgba::new(
+                                    to_srgb(state.debug_shading.diffuse_color[0]),
+                                    to_srgb(state.debug_shading.diffuse_color[1]),
+                                    to_srgb(state.debug_shading.diffuse_color[2]),
+                                    (state.debug_shading.opacity * 255.0) as u8,
+                                );
+                            }
+
+                            // Metallic/Roughness
+                            if state.debug_shading.use_metallic_map && state.debug_shading.use_roughness_map {
+                                model.material.metallic_roughness_texture = c.metallic_roughness_texture.clone();
+                                model.material.metallic = c.metallic;
+                                model.material.roughness = c.roughness;
+                            } else {
+                                model.material.metallic_roughness_texture = None;
+                                if !state.debug_shading.use_metallic_map {
+                                    model.material.metallic = state.debug_shading.metallic;
+                                } else {
+                                    model.material.metallic = c.metallic;
+                                }
+                                if !state.debug_shading.use_roughness_map {
+                                    model.material.roughness = state.debug_shading.roughness;
+                                } else {
+                                    model.material.roughness = c.roughness;
+                                }
+                            }
+
+                            // Normal
+                            if state.debug_shading.use_normal_map {
+                                model.material.normal_texture = c.normal_texture.clone();
+                            } else {
+                                model.material.normal_texture = None;
+                            }
+
+                            // Occlusion
+                            if state.debug_shading.use_occlusion_map {
+                                model.material.occlusion_texture = c.occlusion_texture.clone();
+                            } else {
+                                model.material.occlusion_texture = None;
+                            }
+
+                            // Emissive
+                            if state.debug_shading.use_emissive_map {
+                                model.material.emissive_texture = c.emissive_texture.clone();
+                                model.material.emissive = c.emissive;
+                            } else {
+                                model.material.emissive_texture = None;
+                                model.material.emissive = Srgba::new(
+                                    to_srgb(state.debug_shading.emissive_color[0]),
+                                    to_srgb(state.debug_shading.emissive_color[1]),
+                                    to_srgb(state.debug_shading.emissive_color[2]),
+                                    255,
+                                );
+                            }
+                        }
                     }
                 }
 
                 let screen = frame_input.screen();
 
                 // Use environment lighting or standard lighting
-                if state.use_environment {
+                if let (true, Some(env)) = (state.use_environment, state.environment_map.as_ref()) {
+                    // Render with loaded environment map (skybox + IBL)
+                    screen.clear(ClearState::color_and_depth(0.0, 0.0, 0.0, 1.0, 1.0));
+                    screen.render(
+                        &camera,
+                        (&env.skybox)
+                            .into_iter()
+                            .chain(
+                                state
+                                    .scene
+                                    .models
+                                    .iter()
+                                    .map(|(_p, m)| m as &dyn Object),
+                            )
+                            .chain(std::iter::once(&state.scene.axes as &dyn Object)),
+                        &[&light0, &env.light],
+                    );
+                } else if state.use_environment {
+                    // Fallback environment (no map loaded)
                     screen.clear(ClearState::color_and_depth(0.4, 0.45, 0.5, 1.0, 1.0));
                     screen.render(
                         &camera,
@@ -2049,6 +2579,7 @@ fn main() {
                         &[&light0, &env_ambient],
                     );
                 } else {
+                    // Standard lighting
                     screen.clear(ClearState::color_and_depth(0.15, 0.15, 0.18, 1.0, 1.0));
                     screen.render(
                         &camera,

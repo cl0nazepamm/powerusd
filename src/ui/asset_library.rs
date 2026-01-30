@@ -1,12 +1,34 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
-use rayon;
 use arboard::Clipboard;
 use egui::{self, pos2, vec2, Rect, Vec2};
+use rayon;
+
+/// Get the config directory for powerusd.
+fn config_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var("APPDATA")
+            .ok()
+            .map(|p| PathBuf::from(p).join("powerusd"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME")
+            .ok()
+            .map(|p| PathBuf::from(p).join(".config").join("powerusd"))
+    }
+}
+
+/// Get the path to the library paths config file.
+fn library_config_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("library_paths.txt"))
+}
 
 /// Asset entry in the library browser.
 #[derive(Debug, Clone)]
@@ -359,7 +381,14 @@ pub struct AssetLibrary {
 
 impl Default for AssetLibrary {
     fn default() -> Self {
-        Self {
+        Self::new()
+    }
+}
+
+impl AssetLibrary {
+    /// Create a new AssetLibrary, loading saved paths from config.
+    pub fn new() -> Self {
+        let mut lib = Self {
             visible: false,
             search_query: String::new(),
             library_paths: Vec::new(),
@@ -373,11 +402,58 @@ impl Default for AssetLibrary {
             view_mode: AssetViewMode::default(),
             hide_extensions: true,
             hide_texture_folders: true,
+        };
+        lib.load_config();
+        lib
+    }
+
+    /// Load library paths from config file.
+    pub fn load_config(&mut self) {
+        let Some(config_path) = library_config_path() else {
+            return;
+        };
+
+        if !config_path.exists() {
+            return;
+        }
+
+        let Ok(file) = fs::File::open(&config_path) else {
+            return;
+        };
+
+        let reader = BufReader::new(file);
+        for line in reader.lines().map_while(Result::ok) {
+            let line = line.trim();
+            if !line.is_empty() {
+                let path = PathBuf::from(line);
+                if path.is_dir() && !self.library_paths.contains(&path) {
+                    self.library_paths.push(path);
+                }
+            }
         }
     }
-}
 
-impl AssetLibrary {
+    /// Save library paths to config file.
+    pub fn save_config(&self) {
+        let Some(config_path) = library_config_path() else {
+            return;
+        };
+
+        // Create config directory if it doesn't exist
+        if let Some(parent) = config_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        let Ok(mut file) = fs::File::create(&config_path) else {
+            eprintln!("Failed to save library config to {:?}", config_path);
+            return;
+        };
+
+        for path in &self.library_paths {
+            let _ = writeln!(file, "{}", path.display());
+        }
+    }
+
     /// Toggle visibility with spacebar.
     pub fn toggle(&mut self) {
         self.visible = !self.visible;
@@ -435,17 +511,19 @@ impl AssetLibrary {
             .collect();
     }
 
-    /// Add a library path.
+    /// Add a library path and save config.
     pub fn add_library_path(&mut self, path: PathBuf) {
         if path.is_dir() && !self.library_paths.contains(&path) {
             self.library_paths.push(path);
+            self.save_config();
         }
     }
 
-    /// Remove a library path.
+    /// Remove a library path and save config.
     pub fn remove_library_path(&mut self, index: usize) {
         if index < self.library_paths.len() {
             self.library_paths.remove(index);
+            self.save_config();
         }
     }
 
