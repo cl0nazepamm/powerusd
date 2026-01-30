@@ -9,7 +9,7 @@ One-click batch USD export for digital content creation applications, with built
 ## Features
 
 - Batch export multiple objects/layers/hierarchies as separate USD files
-- Automatic UsdPreviewSurface material fixing for Unreal Engine
+- Automatic UsdPreviewSurface material cleanup so it doesnt come as a mess like Autodesk wants it.
 - Move-to-origin option for clean exports
 - Support for Selection Sets export
 - Blender addon with simple UI
@@ -20,7 +20,7 @@ One-click batch USD export for digital content creation applications, with built
 
 1. Copy `PowerUSD.ms` to your 3ds Max scripts folder:
    ```
-   %USERPROFILE%\AppData\Local\Autodesk\3dsMax\<version>\ENU\scripts\CloneTools\
+   Drag and drop it to your 3dsmax viewport to install.
    ```
 
 2. Copy the `chasers` folder contents to the same location:
@@ -33,6 +33,9 @@ One-click batch USD export for digital content creation applications, with built
    %USERPROFILE%\AppData\Local\Autodesk\3dsMax\<version>\ENU\usericons\PowerUSD\
    ```
 
+![Correct Settings](3dsMax/images/Correct_Settings.png)
+![PowerUSD Rollout](3dsMax/images/PowerUSD_rollout.png)
+
 ### Scripts
 
 | Script | Description |
@@ -43,8 +46,8 @@ One-click batch USD export for digital content creation applications, with built
 
 | Script | Description |
 |--------|-------------|
-| `Clone_USD_Chaser.py` | Fixes UsdPreviewSurface connections for Unreal Engine by bypassing NodeGraphs. |
-| `Clone_USD_PowerUSDChaser.py` | Mesh wrapper script for proper USD hierarchy. |
+| `Clone_USD_CleanStruct.py` | Fixes "nodegraph" mess caused by maxusd. |
+| `Clone_USD_usdWrapper` | Wraps meshes under xform (experimental) |
 
 ### Export Modes
 
