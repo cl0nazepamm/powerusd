@@ -53,8 +53,13 @@ Batch USD exporters included in `dcc-exporters/`:
 - `powerusd.ms` - Batch exporter with layer/hierarchy/selection set modes
 - USD chasers for UE-compatible UsdPreviewSurface materials
 
+Autodesk's Maxusd supports auto conversion for PhysicalMaterial. But I still recommend using "maxusdpreviewsurface".
+You need the chaser script otherwise you cannot display materials bcuz maxusd exporter is a "nodegraph" mess.
+
+It is not supported by unreal, blender or this viewer.
+
 ### Blender
-- `Clone_PowerUSD` addon - One-click batch USD export
+- `Clone_PowerUSD` addon - One-click batch USD export.
 
 See [dcc-exporters/README.md](dcc-exporters/README.md) for installation.
 
