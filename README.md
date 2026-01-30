@@ -5,13 +5,15 @@ Fast USD asset browser and viewer built in pure Rust. Includes batch exporters f
 ## Why?
 
 Current 3D asset library software are:
-- Too slow
-- Bloated
-- Subscription services
-- Don't even have 3D viewer
-- No USD support
+- Too slow.
+- Bloated.
+- Subscription services.
+- No 3D viewer.
+- No USD support.
 
-Comes with DCC exporters for batch processing and quick USD conversion. Stop dealing with ".blend", ".max" (3 different renderer versions), or FBX files.
+Comes with DCC exporters for batch processing and quick USD conversion so you can build libraries of existing assets fast.
+
+I made this so I can stop dealing with .blend or .max files people are selling and build a 3D asset library that runs on a proper format with a lightweight viewing capability. FBX is just as horrible.
 
 ## Interface
 
@@ -24,11 +26,11 @@ Comes with DCC exporters for batch processing and quick USD conversion. Stop dea
 - Persistent library paths (saved to config)
 
 ### 3D Viewer
-- USD/USDA/USDC support
+- USD/USDC support
 - Drag & drop file loading
 - Orbit camera controls
 - Z-up to Y-up conversion (3ds Max support)
-- UsdPreviewSurface and MaterialX materials
+- UsdPreviewSurface
 - Multi-material mesh support (GeomSubsets)
 - Multithreaded texture loading/resizing
 
