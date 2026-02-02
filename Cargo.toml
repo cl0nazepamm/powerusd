@@ -28,4 +28,4 @@ strip = true
 
 # Override logos for openusd compatibility (0.16 has stricter regex validation)
 [patch.crates-io]
-logos = { git = "https://github.com/maciejhirsz/logos", tag = "v0.14.0" }
+logos = { git = "https://github.com/maciejhirsz/logos", tag = "v0.14" }
