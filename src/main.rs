@@ -21,6 +21,7 @@ use openusd::{
 use rayon::prelude::*;
 use three_d::*;
 use three_d_asset::io::load_and_deserialize;
+use ui::gltf::scene_to_model;
 use winit::event::{Event as WinitEvent, WindowEvent};
 
 /// Supported file formats.
@@ -1854,7 +1855,9 @@ fn create_scene(
 fn load_gltf_file(path: &Path, context: &Context) -> Result<(Scene, f32)> {
     println!("Loading glTF: {}", path.display());
 
-    let cpu_model: three_d_asset::Model = load_and_deserialize(path)?;
+    // Load as Scene and convert with our fixed hierarchy transform handling
+    let gltf_scene: three_d_asset::Scene = load_and_deserialize(path)?;
+    let cpu_model = scene_to_model(gltf_scene);
 
     // Calculate bounds from geometries
     let (min, max) = cpu_model
