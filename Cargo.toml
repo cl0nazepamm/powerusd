@@ -25,3 +25,7 @@ rfd = "0.15"
 lto = true
 codegen-units = 1
 strip = true
+
+# Override logos for openusd compatibility (0.16 has stricter regex validation)
+[patch.crates-io]
+logos = { version = "0.14" }
