@@ -25,7 +25,3 @@ rfd = "0.15"
 lto = true
 codegen-units = 1
 strip = true
-
-# Override logos for openusd compatibility (0.16 has stricter regex validation)
-[patch.crates-io]
-logos = { git = "https://github.com/maciejhirsz/logos", tag = "v0.13" }
