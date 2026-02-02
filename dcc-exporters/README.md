@@ -94,10 +94,15 @@ The addon adds a panel in the 3D View sidebar for one-click USD batch export.
 ### Blender
 - Blender 4.0 or newer (with built-in USD support)
 
+## Credits
+
+Script was originally written by Autodesk developer Julien Deboise. I've only improved it for my usage.
+
+- [deboisj](https://github.com/deboisj/)
+
 ## License
 
 MIT License
 
-## Author
 
-Clone
+
