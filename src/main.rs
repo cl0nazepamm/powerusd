@@ -1,11 +1,14 @@
-//! Advanced USD viewer with GUI hierarchy and inspector.
+//! Advanced USD and glTF viewer with GUI hierarchy and inspector.
 //!
-//! This application demonstrates a more complete USD viewing experience using egui.
+//! This application demonstrates a complete 3D asset viewing experience using egui,
+//! supporting both USD (usda/usdc) and glTF/GLB formats with animation playback.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use std::{env, fs};
 
 mod ui;
+use ui::animation::AnimationController;
 use ui::asset_library::AssetLibrary;
 use ui::theme::configure_theme;
 
@@ -17,7 +20,40 @@ use openusd::{
 };
 use rayon::prelude::*;
 use three_d::*;
+use three_d_asset::io::load_and_deserialize;
 use winit::event::{Event as WinitEvent, WindowEvent};
+
+/// Supported file formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileFormat {
+    /// USD ASCII text format (.usda)
+    Usda,
+    /// USD binary crate format (.usdc, .usd)
+    Usdc,
+    /// glTF JSON format (.gltf)
+    Gltf,
+    /// glTF binary format (.glb)
+    Glb,
+}
+
+impl FileFormat {
+    /// Detect file format from path extension.
+    pub fn from_path(path: &Path) -> Option<Self> {
+        let ext = path.extension()?.to_str()?.to_lowercase();
+        match ext.as_str() {
+            "usda" => Some(Self::Usda),
+            "usdc" | "usd" => Some(Self::Usdc),
+            "gltf" => Some(Self::Gltf),
+            "glb" => Some(Self::Glb),
+            _ => None,
+        }
+    }
+
+    /// Check if format is a glTF variant.
+    pub fn is_gltf(&self) -> bool {
+        matches!(self, Self::Gltf | Self::Glb)
+    }
+}
 
 /// Scene up axis orientation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -657,9 +693,25 @@ struct InspectorCache {
     fields: Vec<(String, String)>,
 }
 
+/// Scene content that can be either static USD meshes or animated glTF model.
+enum SceneContent {
+    /// Static USD scene with individual meshes.
+    Static {
+        models: Vec<(sdf::Path, Gm<Mesh, PhysicalMaterial>)>,
+    },
+    /// Animated glTF model with keyframe animations.
+    Animated {
+        model: renderer::object::Model<PhysicalMaterial>,
+        /// Available animation names.
+        animation_names: Vec<Option<String>>,
+        /// Currently selected animation index.
+        current_animation: usize,
+    },
+}
+
 /// Scene state that can be reloaded.
 struct Scene {
-    models: Vec<(sdf::Path, Gm<Mesh, PhysicalMaterial>)>,
+    content: SceneContent,
     axes: Axes,
     center: Vector3<f32>,
     size: f32,
@@ -1008,10 +1060,7 @@ fn get_mesh_material(
     Some(match shader_type {
         ShaderType::UsdPreviewSurface => extract_preview_surface(data, &shader_path),
         ShaderType::MaterialXStandardSurface => {
-            println!(
-                "Found MaterialX standard_surface: {}",
-                shader_path.as_str()
-            );
+            println!("Found MaterialX standard_surface: {}", shader_path.as_str());
             extract_materialx_surface(data, &shader_path)
         }
     })
@@ -1096,8 +1145,8 @@ fn try_extract_meshes(
         .and_then(|v| v.try_as_vec_3f());
 
     // Get normal indices for face-varying interpolation
-    let normal_indices = get_property(data, path, "primvars:normals:indices")
-        .and_then(|v| v.try_as_int_vec());
+    let normal_indices =
+        get_property(data, path, "primvars:normals:indices").and_then(|v| v.try_as_int_vec());
 
     // Try to get UVs from common primvar names
     let raw_uvs = get_property(data, path, "primvars:st")
@@ -1258,7 +1307,8 @@ fn try_extract_meshes(
                     sub_positions.push(expanded_positions[src_idx * 3 + 1]);
                     sub_positions.push(expanded_positions[src_idx * 3 + 2]);
 
-                    if let (Some(ref en), Some(ref mut sn)) = (&expanded_normals, &mut sub_normals) {
+                    if let (Some(ref en), Some(ref mut sn)) = (&expanded_normals, &mut sub_normals)
+                    {
                         sn.push(en[src_idx * 3]);
                         sn.push(en[src_idx * 3 + 1]);
                         sn.push(en[src_idx * 3 + 2]);
@@ -1717,9 +1767,7 @@ fn create_scene(
                     };
 
                 // Compute tangents if normal map is used (required for tangent-space normal mapping)
-                if normal_texture.is_some()
-                    && cpu_mesh.normals.is_some()
-                    && cpu_mesh.uvs.is_some()
+                if normal_texture.is_some() && cpu_mesh.normals.is_some() && cpu_mesh.uvs.is_some()
                 {
                     cpu_mesh.compute_tangents();
                 }
@@ -1795,11 +1843,114 @@ fn create_scene(
     let axes = Axes::new(context, scene_size * 0.001, scene_size * 0.01);
 
     Scene {
-        models,
+        content: SceneContent::Static { models },
         axes,
         center: scene_center,
         size: scene_size,
     }
+}
+
+/// Load a glTF/GLB file and create a Scene with animations.
+fn load_gltf_file(path: &Path, context: &Context) -> Result<(Scene, f32)> {
+    println!("Loading glTF: {}", path.display());
+
+    let cpu_model: three_d_asset::Model = load_and_deserialize(path)?;
+
+    // Calculate bounds from geometries
+    let (min, max) = cpu_model
+        .geometries
+        .iter()
+        .filter_map(|prim| {
+            if let three_d_asset::Geometry::Triangles(mesh) = &prim.geometry {
+                let positions = match &mesh.positions {
+                    three_d_asset::Positions::F32(p) => p,
+                    three_d_asset::Positions::F64(_) => {
+                        // F64 positions not supported for bounds calculation
+                        return None;
+                    }
+                };
+                let mut lmin = vec3(f32::MAX, f32::MAX, f32::MAX);
+                let mut lmax = vec3(f32::MIN, f32::MIN, f32::MIN);
+                for pos in positions {
+                    lmin.x = lmin.x.min(pos.x);
+                    lmin.y = lmin.y.min(pos.y);
+                    lmin.z = lmin.z.min(pos.z);
+                    lmax.x = lmax.x.max(pos.x);
+                    lmax.y = lmax.y.max(pos.y);
+                    lmax.z = lmax.z.max(pos.z);
+                }
+                Some((lmin, lmax))
+            } else {
+                None
+            }
+        })
+        .fold(
+            (
+                vec3(f32::MAX, f32::MAX, f32::MAX),
+                vec3(f32::MIN, f32::MIN, f32::MIN),
+            ),
+            |acc, (lmin, lmax)| {
+                (
+                    vec3(
+                        acc.0.x.min(lmin.x),
+                        acc.0.y.min(lmin.y),
+                        acc.0.z.min(lmin.z),
+                    ),
+                    vec3(
+                        acc.1.x.max(lmax.x),
+                        acc.1.y.max(lmax.y),
+                        acc.1.z.max(lmax.z),
+                    ),
+                )
+            },
+        );
+
+    let (scene_center, scene_size) = if min.x > max.x {
+        (vec3(0.0, 0.0, 0.0), 2.0)
+    } else {
+        let center = (min + max) * 0.5;
+        let size = (max - min).magnitude().max(0.001);
+        (center, size)
+    };
+
+    // Create GPU model with animations
+    let gpu_model = renderer::object::Model::<PhysicalMaterial>::new(context, &cpu_model)?;
+
+    // Get animation names and calculate duration
+    let animation_names = gpu_model.animations();
+
+    // Calculate animation duration from keyframes
+    let duration = cpu_model
+        .geometries
+        .iter()
+        .flat_map(|prim| &prim.animations)
+        .flat_map(|anim| &anim.key_frames)
+        .flat_map(|(_, kf)| kf.loop_time)
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(0.0);
+
+    println!(
+        "Loaded glTF: {} geometries, {} animations, duration: {:.2}s",
+        cpu_model.geometries.len(),
+        animation_names.len(),
+        duration
+    );
+
+    let axes = Axes::new(context, scene_size * 0.001, scene_size * 0.01);
+
+    Ok((
+        Scene {
+            content: SceneContent::Animated {
+                model: gpu_model,
+                animation_names,
+                current_animation: 0,
+            },
+            axes,
+            center: scene_center,
+            size: scene_size,
+        },
+        duration,
+    ))
 }
 
 /// Texture loading mode for scene creation.
@@ -1916,6 +2067,10 @@ struct AppState {
     material_cache: Vec<MaterialCache>,
     /// Track if debug shading was enabled last frame to detect changes.
     debug_shading_was_enabled: bool,
+    /// Animation controller for glTF playback.
+    animation_controller: AnimationController,
+    /// Current file format (USD or glTF).
+    file_format: Option<FileFormat>,
 }
 
 /// Load an environment map from an image file.
@@ -1930,8 +2085,8 @@ fn load_environment_map(context: &Context, path: &Path) -> Option<EnvironmentMap
     Some(EnvironmentMap { skybox, light })
 }
 
-/// Load a USD file and update application state.
-fn load_usd_file(
+/// Load an asset file (USD or glTF) and update application state.
+fn load_asset_file(
     path: &Path,
     context: &Context,
     state: &mut AppState,
@@ -1940,78 +2095,123 @@ fn load_usd_file(
     prev_selected: &mut Option<sdf::Path>,
     window: &winit::window::Window,
 ) {
-    println!("Loading: {}", path.display());
-    match open_usd(path) {
-        Ok(mut new_stage) => {
-            let up_axis = get_up_axis(new_stage.as_mut());
-            if up_axis == UpAxis::Z {
-                println!("Detected Z-up scene (3ds Max), applying coordinate conversion");
-            }
-            let hierarchy = build_hierarchy_cache(new_stage.as_mut(), &sdf::Path::abs_root());
-            let mut meshes = match extract_meshes(new_stage.as_mut(), &sdf::Path::abs_root()) {
-                Ok(m) => {
-                    println!("Loaded {} meshes", m.len());
-                    m
+    let format = FileFormat::from_path(path);
+    println!("Loading: {} (format: {:?})", path.display(), format);
+
+    match format {
+        Some(FileFormat::Gltf) | Some(FileFormat::Glb) => {
+            // Load glTF/GLB file
+            match load_gltf_file(path, context) {
+                Ok((scene, duration)) => {
+                    state.scene = scene;
+                    state.stage = None;
+                    state.selected_path = None;
+                    state.hierarchy_cache = None;
+                    state.inspector_cache = InspectorCache::default();
+                    state.meshes = Vec::new();
+                    state.base_dir = path.parent().map(|p| p.to_path_buf());
+                    state.up_axis = UpAxis::Y; // glTF is always Y-up
+                    state.material_cache.clear();
+                    state.debug_shading_was_enabled = false;
+                    state.file_format = format;
+                    state.animation_controller.set_duration(duration);
+                    state.animation_controller.play();
+                    *prev_selected = None;
+
+                    setup_camera_for_scene(&state.scene, camera, control);
+                    window.set_title(&format!(
+                        "PowerUSD - {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
                 }
                 Err(e) => {
-                    eprintln!("Error extracting meshes: {}", e);
-                    Vec::new()
-                }
-            };
-            let dir = path.parent().map(|p| p.to_path_buf());
-
-            // Load MaterialX materials from the same directory
-            if let Some(ref base_dir) = dir {
-                let mtlx_materials = load_materialx_from_dir(base_dir);
-                if !mtlx_materials.is_empty() {
-                    apply_materialx_to_meshes(&mut meshes, &mtlx_materials, new_stage.as_mut());
+                    eprintln!("Error loading glTF file: {}", e);
                 }
             }
-            state.scene = create_scene(
-                context,
-                &meshes,
-                up_axis,
-                state.texture_mode,
-                dir.as_deref(),
-            );
-            state.stage = Some(new_stage);
-            state.selected_path = None;
-            state.hierarchy_cache = Some(hierarchy);
-            state.inspector_cache = InspectorCache::default();
-            state.meshes = meshes;
-            state.base_dir = dir;
-            state.up_axis = up_axis;
-            state.material_cache.clear();
-            state.debug_shading_was_enabled = false;
-            *prev_selected = None;
-
-            let camera_distance = state.scene.size * 2.0;
-            // Near/far planes scaled to scene size to avoid z-fighting
-            let z_near = (state.scene.size * 0.01).max(0.1);
-            let z_far = state.scene.size * 100.0;
-            *camera = Camera::new_perspective(
-                camera.viewport(),
-                state.scene.center + vec3(camera_distance, camera_distance * 0.5, camera_distance),
-                state.scene.center,
-                vec3(0.0, 1.0, 0.0),
-                degrees(45.0),
-                z_near,
-                z_far,
-            );
-            *control = OrbitControl::new(
-                state.scene.center,
-                state.scene.size * 0.1,
-                state.scene.size * 10.0,
-            );
-            window.set_title(&format!(
-                "PowerUSD - {}",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ));
         }
-        Err(e) => {
-            eprintln!("Error opening USD file: {}", e);
+        Some(FileFormat::Usda) | Some(FileFormat::Usdc) | None => {
+            // Load USD file (or try if extension unrecognized)
+            match open_usd(path) {
+                Ok(mut new_stage) => {
+                    let up_axis = get_up_axis(new_stage.as_mut());
+                    if up_axis == UpAxis::Z {
+                        println!("Detected Z-up scene (3ds Max), applying coordinate conversion");
+                    }
+                    let hierarchy =
+                        build_hierarchy_cache(new_stage.as_mut(), &sdf::Path::abs_root());
+                    let mut meshes =
+                        match extract_meshes(new_stage.as_mut(), &sdf::Path::abs_root()) {
+                            Ok(m) => {
+                                println!("Loaded {} meshes", m.len());
+                                m
+                            }
+                            Err(e) => {
+                                eprintln!("Error extracting meshes: {}", e);
+                                Vec::new()
+                            }
+                        };
+                    let dir = path.parent().map(|p| p.to_path_buf());
+
+                    // Load MaterialX materials from the same directory
+                    if let Some(ref base_dir) = dir {
+                        let mtlx_materials = load_materialx_from_dir(base_dir);
+                        if !mtlx_materials.is_empty() {
+                            apply_materialx_to_meshes(
+                                &mut meshes,
+                                &mtlx_materials,
+                                new_stage.as_mut(),
+                            );
+                        }
+                    }
+                    state.scene = create_scene(
+                        context,
+                        &meshes,
+                        up_axis,
+                        state.texture_mode,
+                        dir.as_deref(),
+                    );
+                    state.stage = Some(new_stage);
+                    state.selected_path = None;
+                    state.hierarchy_cache = Some(hierarchy);
+                    state.inspector_cache = InspectorCache::default();
+                    state.meshes = meshes;
+                    state.base_dir = dir;
+                    state.up_axis = up_axis;
+                    state.material_cache.clear();
+                    state.debug_shading_was_enabled = false;
+                    state.file_format = format;
+                    state.animation_controller.stop(); // USD doesn't have glTF animations
+                    *prev_selected = None;
+
+                    setup_camera_for_scene(&state.scene, camera, control);
+                    window.set_title(&format!(
+                        "PowerUSD - {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                }
+                Err(e) => {
+                    eprintln!("Error opening USD file: {}", e);
+                }
+            }
         }
     }
+}
+
+/// Setup camera and orbit control for a loaded scene.
+fn setup_camera_for_scene(scene: &Scene, camera: &mut Camera, control: &mut OrbitControl) {
+    let camera_distance = scene.size * 2.0;
+    let z_near = (scene.size * 0.01).max(0.1);
+    let z_far = scene.size * 100.0;
+    *camera = Camera::new_perspective(
+        camera.viewport(),
+        scene.center + vec3(camera_distance, camera_distance * 0.5, camera_distance),
+        scene.center,
+        vec3(0.0, 1.0, 0.0),
+        degrees(45.0),
+        z_near,
+        z_far,
+    );
+    *control = OrbitControl::new(scene.center, scene.size * 0.1, scene.size * 10.0);
 }
 
 /// Render hierarchy from cache (no USD queries).
@@ -2095,7 +2295,13 @@ fn main() {
 
     let mut state = AppState {
         stage,
-        scene: create_scene(&context, &meshes, up_axis, TextureMode::None, base_dir.as_deref()),
+        scene: create_scene(
+            &context,
+            &meshes,
+            up_axis,
+            TextureMode::None,
+            base_dir.as_deref(),
+        ),
         selected_path: None,
         hierarchy_cache,
         inspector_cache: InspectorCache::default(),
@@ -2110,7 +2316,10 @@ fn main() {
         debug_shading: DebugShading::default(),
         material_cache: Vec::new(),
         debug_shading_was_enabled: false,
+        animation_controller: AnimationController::default(),
+        file_format: None,
     };
+    let mut last_frame_time = Instant::now();
 
     // Near/far planes scaled to scene size to avoid z-fighting
     let z_near = (state.scene.size * 0.01).max(0.1);
@@ -2154,6 +2363,17 @@ fn main() {
             }
             WinitEvent::RedrawRequested(_) => {
                 let mut frame_input = frame_input_generator.generate(&context);
+
+                // Calculate delta time for animations
+                let now = Instant::now();
+                let delta_time = (now - last_frame_time).as_secs_f32();
+                last_frame_time = now;
+
+                // Update animations for glTF models
+                if let SceneContent::Animated { ref mut model, .. } = state.scene.content {
+                    let anim_time = state.animation_controller.update(delta_time);
+                    model.animate(anim_time);
+                }
 
                 // Update asset library poll for scan results
                 state.asset_library.poll_scan();
@@ -2203,8 +2423,12 @@ fn main() {
                                             &mut state.selected_path,
                                         );
                                     });
+                                } else if state.file_format.map(|f| f.is_gltf()).unwrap_or(false) {
+                                    ui.label("glTF model loaded");
+                                    ui.label("(Hierarchy not available for glTF)");
                                 } else {
-                                    ui.label("No file loaded. Drag & drop a USD file.");
+                                    ui.label("No file loaded.");
+                                    ui.label("Drag & drop a USD or glTF file.");
                                 }
                             });
 
@@ -2246,45 +2470,51 @@ fn main() {
                                     );
                                 }
 
-                                ui.separator();
+                                // Texture loading buttons (USD only - glTF handles textures automatically)
+                                let is_usd = !state.file_format.map(|f| f.is_gltf()).unwrap_or(false);
+                                if is_usd {
+                                    ui.separator();
 
-                                // Texture loading buttons (click again to unload and free memory)
-                                let color_selected = state.texture_mode == TextureMode::ColorOnly;
-                                if ui.selectable_label(color_selected, "Load Color Channel").clicked() {
-                                    // Toggle: if already selected, switch to None to unload textures
-                                    state.texture_mode = if color_selected {
-                                        TextureMode::None
-                                    } else {
-                                        TextureMode::ColorOnly
-                                    };
-                                    state.scene = create_scene(
-                                        &context,
-                                        &state.meshes,
-                                        state.up_axis,
-                                        state.texture_mode,
-                                        state.base_dir.as_deref(),
-                                    );
-                                    state.material_cache.clear();
-                                    state.debug_shading_was_enabled = false;
-                                }
+                                    let color_selected = state.texture_mode == TextureMode::ColorOnly;
+                                    if ui
+                                        .selectable_label(color_selected, "Load Color Channel")
+                                        .clicked()
+                                    {
+                                        // Toggle: if already selected, switch to None to unload textures
+                                        state.texture_mode = if color_selected {
+                                            TextureMode::None
+                                        } else {
+                                            TextureMode::ColorOnly
+                                        };
+                                        state.scene = create_scene(
+                                            &context,
+                                            &state.meshes,
+                                            state.up_axis,
+                                            state.texture_mode,
+                                            state.base_dir.as_deref(),
+                                        );
+                                        state.material_cache.clear();
+                                        state.debug_shading_was_enabled = false;
+                                    }
 
-                                let pbr_selected = state.texture_mode == TextureMode::FullPbr;
-                                if ui.selectable_label(pbr_selected, "Load Full PBR").clicked() {
-                                    // Toggle: if already selected, switch to None to unload textures
-                                    state.texture_mode = if pbr_selected {
-                                        TextureMode::None
-                                    } else {
-                                        TextureMode::FullPbr
-                                    };
-                                    state.scene = create_scene(
-                                        &context,
-                                        &state.meshes,
-                                        state.up_axis,
-                                        state.texture_mode,
-                                        state.base_dir.as_deref(),
-                                    );
-                                    state.material_cache.clear();
-                                    state.debug_shading_was_enabled = false;
+                                    let pbr_selected = state.texture_mode == TextureMode::FullPbr;
+                                    if ui.selectable_label(pbr_selected, "Load Full PBR").clicked() {
+                                        // Toggle: if already selected, switch to None to unload textures
+                                        state.texture_mode = if pbr_selected {
+                                            TextureMode::None
+                                        } else {
+                                            TextureMode::FullPbr
+                                        };
+                                        state.scene = create_scene(
+                                            &context,
+                                            &state.meshes,
+                                            state.up_axis,
+                                            state.texture_mode,
+                                            state.base_dir.as_deref(),
+                                        );
+                                        state.material_cache.clear();
+                                        state.debug_shading_was_enabled = false;
+                                    }
                                 }
 
                                 ui.separator();
@@ -2293,7 +2523,10 @@ fn main() {
                                 let has_env = state.environment_map.is_some();
                                 let env_label = if has_env {
                                     if let Some(ref p) = state.environment_path {
-                                        format!("Env: {}", p.file_name().unwrap_or_default().to_string_lossy())
+                                        format!(
+                                            "Env: {}",
+                                            p.file_name().unwrap_or_default().to_string_lossy()
+                                        )
                                     } else {
                                         "Environment".to_string()
                                     }
@@ -2304,7 +2537,10 @@ fn main() {
                                 if ui.button(&env_label).clicked() {
                                     // Open file dialog for environment map
                                     if let Some(path) = rfd::FileDialog::new()
-                                        .add_filter("HDR/Image", &["hdr", "exr", "png", "jpg", "jpeg"])
+                                        .add_filter(
+                                            "HDR/Image",
+                                            &["hdr", "exr", "png", "jpg", "jpeg"],
+                                        )
                                         .pick_file()
                                     {
                                         if let Some(env) = load_environment_map(&context, &path) {
@@ -2323,6 +2559,99 @@ fn main() {
 
                                 ui.checkbox(&mut state.debug_shading.enabled, "Debug Shading");
 
+                                // Animation controls (only for glTF with animations)
+                                if let SceneContent::Animated {
+                                    ref animation_names,
+                                    ref mut current_animation,
+                                    ref mut model,
+                                } = state.scene.content
+                                {
+                                    if state.animation_controller.duration > 0.0 {
+                                        ui.separator();
+
+                                        // Play/Pause button
+                                        let play_label = if state.animation_controller.playing {
+                                            "⏸"
+                                        } else {
+                                            "▶"
+                                        };
+                                        if ui.button(play_label).clicked() {
+                                            state.animation_controller.toggle();
+                                        }
+
+                                        // Stop button
+                                        if ui.button("⏹").clicked() {
+                                            state.animation_controller.stop();
+                                        }
+
+                                        // Time scrubber
+                                        let mut pos =
+                                            state.animation_controller.normalized_position();
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(&mut pos, 0.0..=1.0)
+                                                    .show_value(false)
+                                                    .text(format!(
+                                                        "{:.1}s",
+                                                        state.animation_controller.current_time
+                                                    )),
+                                            )
+                                            .changed()
+                                        {
+                                            state.animation_controller.seek_normalized(pos);
+                                        }
+
+                                        // Speed control
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut state.animation_controller.speed,
+                                                0.1..=2.0,
+                                            )
+                                            .text("Speed"),
+                                        );
+
+                                        // Loop checkbox
+                                        ui.checkbox(
+                                            &mut state.animation_controller.looping,
+                                            "Loop",
+                                        );
+
+                                        // Animation selector (if multiple animations)
+                                        if animation_names.len() > 1 {
+                                            let current_name = animation_names
+                                                .get(*current_animation)
+                                                .and_then(|n| n.as_ref())
+                                                .map(|s| s.as_str())
+                                                .unwrap_or("Default");
+
+                                            egui::ComboBox::from_label("Animation")
+                                                .selected_text(current_name)
+                                                .show_ui(ui, |ui| {
+                                                    for (i, name) in
+                                                        animation_names.iter().enumerate()
+                                                    {
+                                                        let label = name
+                                                            .as_ref()
+                                                            .map(|s| s.as_str())
+                                                            .unwrap_or("Default");
+                                                        if ui
+                                                            .selectable_label(
+                                                                i == *current_animation,
+                                                                label,
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            *current_animation = i;
+                                                            model.choose_animation(name.as_deref());
+                                                            state.animation_controller.stop();
+                                                            state.animation_controller.play();
+                                                        }
+                                                    }
+                                                });
+                                        }
+                                    }
+                                }
+
                                 ui.separator();
                                 ui.label("Press SPACE for Asset Library");
                             });
@@ -2336,42 +2665,76 @@ fn main() {
                                 .resizable(true)
                                 .show(gui_context, |ui| {
                                     ui.heading("Map Toggles");
-                                    ui.checkbox(&mut state.debug_shading.use_diffuse_map, "Use Diffuse Map");
-                                    ui.checkbox(&mut state.debug_shading.use_metallic_map, "Use Metallic Map");
-                                    ui.checkbox(&mut state.debug_shading.use_roughness_map, "Use Roughness Map");
-                                    ui.checkbox(&mut state.debug_shading.use_normal_map, "Use Normal Map");
-                                    ui.checkbox(&mut state.debug_shading.use_occlusion_map, "Use Occlusion Map");
-                                    ui.checkbox(&mut state.debug_shading.use_emissive_map, "Use Emissive Map");
+                                    ui.checkbox(
+                                        &mut state.debug_shading.use_diffuse_map,
+                                        "Use Diffuse Map",
+                                    );
+                                    ui.checkbox(
+                                        &mut state.debug_shading.use_metallic_map,
+                                        "Use Metallic Map",
+                                    );
+                                    ui.checkbox(
+                                        &mut state.debug_shading.use_roughness_map,
+                                        "Use Roughness Map",
+                                    );
+                                    ui.checkbox(
+                                        &mut state.debug_shading.use_normal_map,
+                                        "Use Normal Map",
+                                    );
+                                    ui.checkbox(
+                                        &mut state.debug_shading.use_occlusion_map,
+                                        "Use Occlusion Map",
+                                    );
+                                    ui.checkbox(
+                                        &mut state.debug_shading.use_emissive_map,
+                                        "Use Emissive Map",
+                                    );
 
                                     ui.separator();
                                     ui.heading("Override Values");
 
                                     ui.horizontal(|ui| {
                                         ui.label("Diffuse:");
-                                        ui.color_edit_button_rgb(&mut state.debug_shading.diffuse_color);
+                                        ui.color_edit_button_rgb(
+                                            &mut state.debug_shading.diffuse_color,
+                                        );
                                     });
 
                                     ui.add(
-                                        egui::Slider::new(&mut state.debug_shading.metallic, 0.0..=1.0)
-                                            .text("Metallic"),
+                                        egui::Slider::new(
+                                            &mut state.debug_shading.metallic,
+                                            0.0..=1.0,
+                                        )
+                                        .text("Metallic"),
                                     );
                                     ui.add(
-                                        egui::Slider::new(&mut state.debug_shading.specular, 0.0..=1.0)
-                                            .text("Specular"),
+                                        egui::Slider::new(
+                                            &mut state.debug_shading.specular,
+                                            0.0..=1.0,
+                                        )
+                                        .text("Specular"),
                                     );
                                     ui.add(
-                                        egui::Slider::new(&mut state.debug_shading.roughness, 0.0..=1.0)
-                                            .text("Roughness"),
+                                        egui::Slider::new(
+                                            &mut state.debug_shading.roughness,
+                                            0.0..=1.0,
+                                        )
+                                        .text("Roughness"),
                                     );
 
                                     ui.horizontal(|ui| {
                                         ui.label("Emissive:");
-                                        ui.color_edit_button_rgb(&mut state.debug_shading.emissive_color);
+                                        ui.color_edit_button_rgb(
+                                            &mut state.debug_shading.emissive_color,
+                                        );
                                     });
 
                                     ui.add(
-                                        egui::Slider::new(&mut state.debug_shading.opacity, 0.0..=1.0)
-                                            .text("Opacity"),
+                                        egui::Slider::new(
+                                            &mut state.debug_shading.opacity,
+                                            0.0..=1.0,
+                                        )
+                                        .text("Opacity"),
                                     );
 
                                     ui.separator();
@@ -2400,7 +2763,7 @@ fn main() {
 
                 // Load file if requested from asset library
                 if let Some(path) = file_to_load {
-                    load_usd_file(
+                    load_asset_file(
                         &path,
                         &context,
                         &mut state,
@@ -2453,99 +2816,113 @@ fn main() {
                     }
                 }
 
-                // Handle debug shading state changes
-                if state.debug_shading.enabled && !state.debug_shading_was_enabled {
-                    // Debug shading just enabled - cache current materials
-                    state.material_cache = state
-                        .scene
-                        .models
-                        .iter()
-                        .map(|(_, model)| MaterialCache::from_material(&model.material))
-                        .collect();
-                } else if !state.debug_shading.enabled && state.debug_shading_was_enabled {
-                    // Debug shading just disabled - restore materials from cache
-                    for (i, (_, model)) in state.scene.models.iter_mut().enumerate() {
-                        if let Some(cache) = state.material_cache.get(i) {
-                            cache.restore_to_material(&mut model.material);
+                // Handle debug shading state changes (only for static USD scenes)
+                if let SceneContent::Static { ref mut models } = state.scene.content {
+                    if state.debug_shading.enabled && !state.debug_shading_was_enabled {
+                        // Debug shading just enabled - cache current materials
+                        state.material_cache = models
+                            .iter()
+                            .map(|(_, model)| MaterialCache::from_material(&model.material))
+                            .collect();
+                    } else if !state.debug_shading.enabled && state.debug_shading_was_enabled {
+                        // Debug shading just disabled - restore materials from cache
+                        for (i, (_, model)) in models.iter_mut().enumerate() {
+                            if let Some(cache) = state.material_cache.get(i) {
+                                cache.restore_to_material(&mut model.material);
+                            }
                         }
                     }
                 }
                 state.debug_shading_was_enabled = state.debug_shading.enabled;
 
-                // Apply debug shading if enabled (non-destructive using cache)
+                // Apply debug shading if enabled (non-destructive using cache, only for static scenes)
                 if state.debug_shading.enabled {
-                    let to_srgb = |c: f32| -> u8 { (c.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8 };
+                    if let SceneContent::Static { ref mut models } = state.scene.content {
+                        let to_srgb =
+                            |c: f32| -> u8 { (c.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8 };
 
-                    for (i, (_, model)) in state.scene.models.iter_mut().enumerate() {
-                        let cache = state.material_cache.get(i);
+                        for (i, (_, model)) in models.iter_mut().enumerate() {
+                            let cache = state.material_cache.get(i);
 
-                        // Restore from cache first, then apply overrides
-                        if let Some(c) = cache {
-                            // Diffuse/Albedo
-                            if state.debug_shading.use_diffuse_map {
-                                model.material.albedo_texture = c.albedo_texture.clone();
-                                model.material.albedo = c.albedo;
-                            } else {
-                                model.material.albedo_texture = None;
-                                model.material.albedo = Srgba::new(
-                                    to_srgb(state.debug_shading.diffuse_color[0]),
-                                    to_srgb(state.debug_shading.diffuse_color[1]),
-                                    to_srgb(state.debug_shading.diffuse_color[2]),
-                                    (state.debug_shading.opacity * 255.0) as u8,
-                                );
-                            }
-
-                            // Metallic/Roughness
-                            if state.debug_shading.use_metallic_map && state.debug_shading.use_roughness_map {
-                                model.material.metallic_roughness_texture = c.metallic_roughness_texture.clone();
-                                model.material.metallic = c.metallic;
-                                model.material.roughness = c.roughness;
-                            } else {
-                                model.material.metallic_roughness_texture = None;
-                                if !state.debug_shading.use_metallic_map {
-                                    model.material.metallic = state.debug_shading.metallic;
+                            // Restore from cache first, then apply overrides
+                            if let Some(c) = cache {
+                                // Diffuse/Albedo
+                                if state.debug_shading.use_diffuse_map {
+                                    model.material.albedo_texture = c.albedo_texture.clone();
+                                    model.material.albedo = c.albedo;
                                 } else {
+                                    model.material.albedo_texture = None;
+                                    model.material.albedo = Srgba::new(
+                                        to_srgb(state.debug_shading.diffuse_color[0]),
+                                        to_srgb(state.debug_shading.diffuse_color[1]),
+                                        to_srgb(state.debug_shading.diffuse_color[2]),
+                                        (state.debug_shading.opacity * 255.0) as u8,
+                                    );
+                                }
+
+                                // Metallic/Roughness
+                                if state.debug_shading.use_metallic_map
+                                    && state.debug_shading.use_roughness_map
+                                {
+                                    model.material.metallic_roughness_texture =
+                                        c.metallic_roughness_texture.clone();
                                     model.material.metallic = c.metallic;
-                                }
-                                if !state.debug_shading.use_roughness_map {
-                                    model.material.roughness = state.debug_shading.roughness;
-                                } else {
                                     model.material.roughness = c.roughness;
+                                } else {
+                                    model.material.metallic_roughness_texture = None;
+                                    if !state.debug_shading.use_metallic_map {
+                                        model.material.metallic = state.debug_shading.metallic;
+                                    } else {
+                                        model.material.metallic = c.metallic;
+                                    }
+                                    if !state.debug_shading.use_roughness_map {
+                                        model.material.roughness = state.debug_shading.roughness;
+                                    } else {
+                                        model.material.roughness = c.roughness;
+                                    }
                                 }
-                            }
 
-                            // Normal
-                            if state.debug_shading.use_normal_map {
-                                model.material.normal_texture = c.normal_texture.clone();
-                            } else {
-                                model.material.normal_texture = None;
-                            }
+                                // Normal
+                                if state.debug_shading.use_normal_map {
+                                    model.material.normal_texture = c.normal_texture.clone();
+                                } else {
+                                    model.material.normal_texture = None;
+                                }
 
-                            // Occlusion
-                            if state.debug_shading.use_occlusion_map {
-                                model.material.occlusion_texture = c.occlusion_texture.clone();
-                            } else {
-                                model.material.occlusion_texture = None;
-                            }
+                                // Occlusion
+                                if state.debug_shading.use_occlusion_map {
+                                    model.material.occlusion_texture = c.occlusion_texture.clone();
+                                } else {
+                                    model.material.occlusion_texture = None;
+                                }
 
-                            // Emissive
-                            if state.debug_shading.use_emissive_map {
-                                model.material.emissive_texture = c.emissive_texture.clone();
-                                model.material.emissive = c.emissive;
-                            } else {
-                                model.material.emissive_texture = None;
-                                model.material.emissive = Srgba::new(
-                                    to_srgb(state.debug_shading.emissive_color[0]),
-                                    to_srgb(state.debug_shading.emissive_color[1]),
-                                    to_srgb(state.debug_shading.emissive_color[2]),
-                                    255,
-                                );
+                                // Emissive
+                                if state.debug_shading.use_emissive_map {
+                                    model.material.emissive_texture = c.emissive_texture.clone();
+                                    model.material.emissive = c.emissive;
+                                } else {
+                                    model.material.emissive_texture = None;
+                                    model.material.emissive = Srgba::new(
+                                        to_srgb(state.debug_shading.emissive_color[0]),
+                                        to_srgb(state.debug_shading.emissive_color[1]),
+                                        to_srgb(state.debug_shading.emissive_color[2]),
+                                        255,
+                                    );
+                                }
                             }
                         }
                     }
                 }
 
                 let screen = frame_input.screen();
+
+                // Collect objects to render based on scene content type
+                let scene_objects: Vec<&dyn Object> = match &state.scene.content {
+                    SceneContent::Static { models } => {
+                        models.iter().map(|(_, m)| m as &dyn Object).collect()
+                    }
+                    SceneContent::Animated { model, .. } => model.into_iter().collect(),
+                };
 
                 // Use environment lighting or standard lighting
                 if let (true, Some(env)) = (state.use_environment, state.environment_map.as_ref()) {
@@ -2555,13 +2932,7 @@ fn main() {
                         &camera,
                         (&env.skybox)
                             .into_iter()
-                            .chain(
-                                state
-                                    .scene
-                                    .models
-                                    .iter()
-                                    .map(|(_p, m)| m as &dyn Object),
-                            )
+                            .chain(scene_objects)
                             .chain(std::iter::once(&state.scene.axes as &dyn Object)),
                         &[&light0, &env.light],
                     );
@@ -2570,11 +2941,8 @@ fn main() {
                     screen.clear(ClearState::color_and_depth(0.4, 0.45, 0.5, 1.0, 1.0));
                     screen.render(
                         &camera,
-                        state
-                            .scene
-                            .models
-                            .iter()
-                            .map(|(_p, m)| m as &dyn Object)
+                        scene_objects
+                            .into_iter()
                             .chain(std::iter::once(&state.scene.axes as &dyn Object)),
                         &[&light0, &env_ambient],
                     );
@@ -2583,11 +2951,8 @@ fn main() {
                     screen.clear(ClearState::color_and_depth(0.15, 0.15, 0.18, 1.0, 1.0));
                     screen.render(
                         &camera,
-                        state
-                            .scene
-                            .models
-                            .iter()
-                            .map(|(_p, m)| m as &dyn Object)
+                        scene_objects
+                            .into_iter()
                             .chain(std::iter::once(&state.scene.axes as &dyn Object)),
                         &[&light0, &light1, &ambient],
                     );
@@ -2611,7 +2976,7 @@ fn main() {
                         control_flow.set_exit();
                     }
                     WindowEvent::DroppedFile(path) => {
-                        load_usd_file(
+                        load_asset_file(
                             path,
                             &context,
                             &mut state,

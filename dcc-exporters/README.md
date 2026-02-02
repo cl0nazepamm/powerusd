@@ -32,8 +32,6 @@ One-click batch USD export for digital content creation applications, with built
    ```
    %USERPROFILE%\AppData\Local\Autodesk\3dsMax\<version>\ENU\usericons\PowerUSD\
    ```
-
-![Correct Settings](3dsMax/images/Correct_Settings.png)
 ![PowerUSD Rollout](3dsMax/images/PowerUSD_rollout.png)
 
 ### Scripts
@@ -47,7 +45,16 @@ One-click batch USD export for digital content creation applications, with built
 | Script | Description |
 |--------|-------------|
 | `Clone_USD_CleanStruct.py` | Fixes UsdPreviewSurface connections for Unreal Engine by bypassing NodeGraphs. |
-| `Clone_USD_usdWrapper` | Wraps meshes under xform (experimental) |
+| `Clone_USD_usdWrapper.py` | Wraps mesh under one more xform. See pictures below to understand what it actually does. |
+
+
+### Screenshots
+
+![without](3dsMax/images/wrapper_off.png)
+![with](3dsMax/images/wrapper_on.png)
+![with](3dsMax/images/clean_on.png)
+![without](3dsMax/images/clean_off.png)
+
 
 ### Export Modes
 
@@ -55,6 +62,11 @@ One-click batch USD export for digital content creation applications, with built
 - **Respect Layers**: Export one USD file per layer containing selected objects
 - **Respect Hierarchies**: Export one USD file per hierarchy root (root + all children)
 - **Selection Sets**: Export all named Selection Sets as separate USD files
+
+### Settings to Change
+![Correct Settings](3dsMax/images/Correct_Settings.png)
+
+
 
 ## Blender
 

@@ -85,7 +85,7 @@ impl ThumbnailCache {
         let mut count = 0;
         while let Ok((path, result)) = self.rx.try_recv() {
             self.loading.remove(&path);
-            
+
             match result {
                 Ok((image, size)) => {
                     let handle = ctx.load_texture(
@@ -93,13 +93,14 @@ impl ThumbnailCache {
                         image,
                         egui::TextureOptions::LINEAR,
                     );
-                    self.textures.insert(path, ThumbnailTexture { handle, size });
+                    self.textures
+                        .insert(path, ThumbnailTexture { handle, size });
                 }
                 Err(_) => {
                     self.failed.insert(path);
                 }
             }
-            
+
             count += 1;
             if count > 20 {
                 break;
@@ -135,7 +136,7 @@ impl ThumbnailCache {
         self.loading.insert(path.to_path_buf());
         let path_clone = path.to_path_buf();
         let tx = self.tx.clone();
-        
+
         // Use rayon spawn for thread pooling if possible, falling back to thread::spawn
         // Assuming rayon is available in the workspace
         rayon::spawn(move || {
@@ -161,7 +162,7 @@ impl ThumbnailCache {
                 }
                 Err(_) => Err(()),
             };
-            
+
             let _ = tx.send((path_clone, result));
         });
 
@@ -231,7 +232,7 @@ fn paint_cropped_image(ui: &mut egui::Ui, texture: &ThumbnailTexture, target_siz
     if image_size.x == 0.0 || image_size.y == 0.0 {
         return;
     }
-    
+
     let image_aspect = image_size.x / image_size.y;
     let target_aspect = target_size.x / target_size.y;
 
@@ -250,8 +251,11 @@ fn paint_cropped_image(ui: &mut egui::Ui, texture: &ThumbnailTexture, target_siz
     };
 
     ui.add(
-        egui::Image::new(egui::load::SizedTexture::new(texture.handle.id(), target_size))
-            .uv(uv_rect)
+        egui::Image::new(egui::load::SizedTexture::new(
+            texture.handle.id(),
+            target_size,
+        ))
+        .uv(uv_rect),
     );
 }
 
@@ -284,7 +288,7 @@ fn find_thumbnail_paths(path: &Path, is_dir: bool) -> (Option<PathBuf>, Option<P
         let name_cover2_path = parent.join(format!("{}_cover2", stem));
         // Also check name_thumb for backward compatibility/3ds max
         let name_thumb_path = parent.join(format!("{}_thumb", stem));
-        
+
         let grid = check_exts(name_path).or_else(|| check_exts(name_thumb_path));
         let cover = check_exts(name_cover2_path);
         (grid, cover)
@@ -322,9 +326,12 @@ fn scan_directory_fast(dir: &Path) -> Vec<AssetEntry> {
                 });
             }
 
-            // Filter for USD file types
+            // Filter for USD and glTF file types
             let ext = path.extension()?.to_str()?.to_lowercase();
-            if matches!(ext.as_str(), "usd" | "usda" | "usdc" | "usdz") {
+            if matches!(
+                ext.as_str(),
+                "usd" | "usda" | "usdc" | "usdz" | "gltf" | "glb"
+            ) {
                 let (thumb_grid, thumb_cover) = find_thumbnail_paths(&path, false);
                 Some(AssetEntry {
                     path,
@@ -594,7 +601,10 @@ impl AssetLibrary {
                     self.view_mode = AssetViewMode::Cover;
                 }
                 ui.separator();
-                if ui.checkbox(&mut self.hide_texture_folders, "Hide Texture Folders").changed() {
+                if ui
+                    .checkbox(&mut self.hide_texture_folders, "Hide Texture Folders")
+                    .changed()
+                {
                     self.apply_filter();
                 }
                 ui.checkbox(&mut self.hide_extensions, "Hide Extensions");
@@ -720,7 +730,8 @@ impl AssetLibrary {
                                             }
                                         }
 
-                                        let (thumb_grid, thumb_cover) = find_thumbnail_paths(path, true);
+                                        let (thumb_grid, thumb_cover) =
+                                            find_thumbnail_paths(path, true);
                                         let thumb = thumb_grid.or(thumb_cover); // Prefer grid, fallback to cover
                                         let card_id = egui::Id::new(("lib_root", path.as_path()));
 
@@ -733,7 +744,9 @@ impl AssetLibrary {
                                                             .thumbnail_cache
                                                             .load_thumbnail(ctx, thumb_path)
                                                         {
-                                                            paint_cropped_image(ui, tex, thumb_size);
+                                                            paint_cropped_image(
+                                                                ui, tex, thumb_size,
+                                                            );
                                                         } else {
                                                             ui.add_sized(
                                                                 thumb_size,
@@ -772,9 +785,11 @@ impl AssetLibrary {
                                 let card_size = egui::vec2(thumb_width + 16.0, thumb_height + 16.0);
                                 ui.horizontal_wrapped(|ui| {
                                     for (idx, path) in paths.iter() {
-                                        let (thumb_grid, thumb_cover) = find_thumbnail_paths(path, true);
+                                        let (thumb_grid, thumb_cover) =
+                                            find_thumbnail_paths(path, true);
                                         let thumb = thumb_cover.or(thumb_grid); // Prefer cover, fallback to grid
-                                        let card_id = egui::Id::new(("lib_root_cover", path.as_path()));
+                                        let card_id =
+                                            egui::Id::new(("lib_root_cover", path.as_path()));
 
                                         let resp =
                                             asset_card(ui, card_id, card_size, thumb_size, |ui| {
@@ -785,7 +800,9 @@ impl AssetLibrary {
                                                             .thumbnail_cache
                                                             .load_thumbnail(ctx, thumb_path)
                                                         {
-                                                            paint_cropped_image(ui, tex, thumb_size);
+                                                            paint_cropped_image(
+                                                                ui, tex, thumb_size,
+                                                            );
                                                         } else {
                                                             ui.add_sized(
                                                                 thumb_size,
@@ -820,7 +837,7 @@ impl AssetLibrary {
                 } else {
                     // Show directory contents
                     if self.filtered.is_empty() {
-                        ui.label("No USD assets found.");
+                        ui.label("No assets found (USD/glTF).");
                     } else {
                         let entries = self.filtered.to_vec();
 
@@ -867,9 +884,12 @@ impl AssetLibrary {
 
                                         let card_id =
                                             egui::Id::new(("asset", entry.path.as_path()));
-                                        
+
                                         // Prefer grid thumb, fallback to cover
-                                        let thumb = entry.thumbnail_grid.as_ref().or(entry.thumbnail_cover.as_ref());
+                                        let thumb = entry
+                                            .thumbnail_grid
+                                            .as_ref()
+                                            .or(entry.thumbnail_cover.as_ref());
 
                                         let resp =
                                             asset_card(ui, card_id, card_size, thumb_size, |ui| {
@@ -880,7 +900,9 @@ impl AssetLibrary {
                                                             .thumbnail_cache
                                                             .load_thumbnail(ctx, thumb_path)
                                                         {
-                                                            paint_cropped_image(ui, tex, thumb_size);
+                                                            paint_cropped_image(
+                                                                ui, tex, thumb_size,
+                                                            );
                                                         } else {
                                                             ui.add_sized(
                                                                 thumb_size,
@@ -926,9 +948,12 @@ impl AssetLibrary {
                                         let icon = if entry.is_dir { "📁" } else { "📄" };
                                         let card_id =
                                             egui::Id::new(("asset_cover", entry.path.as_path()));
-                                        
+
                                         // Prefer cover thumb, fallback to grid
-                                        let thumb = entry.thumbnail_cover.as_ref().or(entry.thumbnail_grid.as_ref());
+                                        let thumb = entry
+                                            .thumbnail_cover
+                                            .as_ref()
+                                            .or(entry.thumbnail_grid.as_ref());
 
                                         let resp =
                                             asset_card(ui, card_id, card_size, thumb_size, |ui| {
@@ -939,7 +964,9 @@ impl AssetLibrary {
                                                             .thumbnail_cache
                                                             .load_thumbnail(ctx, thumb_path)
                                                         {
-                                                            paint_cropped_image(ui, tex, thumb_size);
+                                                            paint_cropped_image(
+                                                                ui, tex, thumb_size,
+                                                            );
                                                         } else {
                                                             ui.add_sized(
                                                                 thumb_size,

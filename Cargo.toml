@@ -11,6 +11,7 @@ categories = ["graphics", "rendering", "visualization"]
 [dependencies]
 openusd = { path = "deps/openusd" }
 three-d = { path = "deps/three-d", features = ["egui-gui"] }
+three-d-asset = { path = "deps/three-d-asset", features = ["gltf", "png", "jpeg"] }
 anyhow = "1.0"
 winit = "0.28"
 egui = "0.32"
