@@ -1,0 +1,194 @@
+[package]
+name = "three-d"
+version = "0.19.0" # Remember to update example links
+authors = ["Asger Nyman Christiansen <asgernyman@gmail.com>"]
+edition = "2021"
+description = "2D/3D renderer - makes it simple to draw stuff across platforms (including web)"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/asny/three-d"
+categories = ["graphics", "rendering", "visualization", "wasm", "web-programming"]
+keywords = ["3d", "gamedev", "webassembly", "opengl", "webgl"]
+exclude = ["/examples", ".gitignore", "/web"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "wasm32-unknown-unknown"]
+
+[features]
+default = ["window"]
+window = ["glutin", "winit", "raw-window-handle", "wasm-bindgen", "serde", "serde-wasm-bindgen", "web-sys"] # Window module
+egui-gui = ["egui_glow", "egui", "getrandom"] # Additional GUI features 
+text = ["swash", "lyon"] # Text mesh generation features
+
+[dependencies]
+glow = "0.16"
+cgmath = "0.18"
+three-d-asset = "0.9"
+thiserror = "2"
+open-enum = "0.5"
+winit = {version = "0.28", optional = true}
+egui = { version = "0.32", optional = true }
+egui_glow = { version = "0.32", optional = true }
+getrandom = { version = "0.2", features = ["js"], optional = true }
+swash = { version = "0.1", optional = true }
+lyon = { version = "1", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+glutin = { version = "0.30", optional = true }
+raw-window-handle = { version = "0.5", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = {version = "0.2", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+web-sys = { version = "0.3", features = ['Document', 'HtmlCollection', 'HtmlCanvasElement', 'Window'], optional = true }
+instant = "0.1.11"
+
+[dev-dependencies]
+rand = "0.7"
+three-d-asset = { version = "0.9", features = ["hdr", "gltf", "obj", "vol", "pcd", "png", "jpeg", "data-url"] }
+noise = {version = "0.6", default-features = false}
+winit = "0.28"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[[example]]
+name = "triangle"
+path = "examples/triangle/src/main.rs"
+
+[[example]]
+name = "triangle_core"
+path = "examples/triangle_core/src/main.rs"
+
+[[example]]
+name = "text"
+path = "examples/text/src/main.rs"
+required-features = ["text"]
+
+[[example]]
+name = "screen"
+path = "examples/screen/src/main.rs"
+required-features = ["egui-gui"]
+
+[[example]]
+name = "multisample"
+path = "examples/multisample/src/main.rs"
+required-features = ["egui-gui"]
+
+[[example]]
+name = "mandelbrot"
+path = "examples/mandelbrot/src/main.rs"
+
+[[example]]
+name = "shapes2d"
+path = "examples/shapes2d/src/main.rs"
+
+[[example]]
+name = "shapes"
+path = "examples/shapes/src/main.rs"
+
+[[example]]
+name = "instanced_draw_order"
+path = "examples/instanced_draw_order/src/main.rs"
+
+[[example]]
+name = "instanced_shapes"
+path = "examples/instanced_shapes/src/main.rs"
+required-features = ["egui-gui"]
+
+[[example]]
+name = "animation"
+path = "examples/animation/src/main.rs"
+
+[[example]]
+name = "sprites"
+path = "examples/sprites/src/main.rs"
+
+[[example]]
+name = "texture"
+path = "examples/texture/src/main.rs"
+required-features = ["egui-gui"]
+
+[[example]]
+name = "volume"
+path = "examples/volume/src/main.rs"
+required-features = ["egui-gui"]
+
+[[example]]
+name = "point_cloud"
+path = "examples/point_cloud/src/main.rs"
+
+[[example]]
+name = "picking"
+path = "examples/picking/src/main.rs"
+
+[[example]]
+name = "environment"
+path = "examples/environment/src/main.rs"
+required-features = ["egui-gui"]
+
+[[example]]
+name = "pbr"
+path = "examples/pbr/src/main.rs"
+required-features = ["egui-gui"]
+
+[[example]]
+name = "lighting"
+path = "examples/lighting/src/main.rs"
+required-features = ["egui-gui"]
+
+[[example]]
+name = "lights"
+path = "examples/lights/src/main.rs"
+required-features = ["egui-gui"]
+
+[[example]]
+name = "image"
+path = "examples/image/src/main.rs"
+required-features = ["egui-gui"]
+
+[[example]]
+name = "effect"
+path = "examples/effect/src/main.rs"
+
+[[example]]
+name = "particles"
+path = "examples/particles/src/main.rs"
+
+[[example]]
+name = "terrain"
+path = "examples/terrain/src/main.rs"
+required-features = ["egui-gui"]
+
+[[example]]
+name = "statues"
+path = "examples/statues/src/main.rs"
+required-features = ["egui-gui"]
+
+[[example]]
+name = "wireframe"
+path = "examples/wireframe/src/main.rs"
+
+[[example]]
+name = "imposters"
+path = "examples/imposters/src/main.rs"
+
+[[example]]
+name = "normals"
+path = "examples/normals/src/main.rs"
+
+[[example]]
+name = "winit_window"
+path = "examples/winit_window/src/main.rs"
+
+[[example]]
+name = "multiwindow"
+path = "examples/multiwindow/src/main.rs"
+
+[[example]]
+name = "logo"
+path = "examples/logo/src/main.rs"
