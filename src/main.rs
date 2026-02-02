@@ -2005,6 +2005,74 @@ impl Default for DebugShading {
     }
 }
 
+impl DebugShading {
+    /// Apply debug shading overrides to a material using cached original values.
+    fn apply_to_material(&self, mat: &mut PhysicalMaterial, cache: &MaterialCache) {
+        let to_srgb = |c: f32| -> u8 { (c.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8 };
+
+        // Diffuse/Albedo
+        if self.use_diffuse_map {
+            mat.albedo_texture = cache.albedo_texture.clone();
+            mat.albedo = cache.albedo;
+        } else {
+            mat.albedo_texture = None;
+            mat.albedo = Srgba::new(
+                to_srgb(self.diffuse_color[0]),
+                to_srgb(self.diffuse_color[1]),
+                to_srgb(self.diffuse_color[2]),
+                (self.opacity * 255.0) as u8,
+            );
+        }
+
+        // Metallic/Roughness
+        if self.use_metallic_map && self.use_roughness_map {
+            mat.metallic_roughness_texture = cache.metallic_roughness_texture.clone();
+            mat.metallic = cache.metallic;
+            mat.roughness = cache.roughness;
+        } else {
+            mat.metallic_roughness_texture = None;
+            mat.metallic = if self.use_metallic_map {
+                cache.metallic
+            } else {
+                self.metallic
+            };
+            mat.roughness = if self.use_roughness_map {
+                cache.roughness
+            } else {
+                self.roughness
+            };
+        }
+
+        // Normal
+        if self.use_normal_map {
+            mat.normal_texture = cache.normal_texture.clone();
+        } else {
+            mat.normal_texture = None;
+        }
+
+        // Occlusion
+        if self.use_occlusion_map {
+            mat.occlusion_texture = cache.occlusion_texture.clone();
+        } else {
+            mat.occlusion_texture = None;
+        }
+
+        // Emissive
+        if self.use_emissive_map {
+            mat.emissive_texture = cache.emissive_texture.clone();
+            mat.emissive = cache.emissive;
+        } else {
+            mat.emissive_texture = None;
+            mat.emissive = Srgba::new(
+                to_srgb(self.emissive_color[0]),
+                to_srgb(self.emissive_color[1]),
+                to_srgb(self.emissive_color[2]),
+                255,
+            );
+        }
+    }
+}
+
 /// Cached original material values for non-destructive debug shading.
 #[derive(Clone)]
 struct MaterialCache {
@@ -2471,11 +2539,13 @@ fn main() {
                                 }
 
                                 // Texture loading buttons (USD only - glTF handles textures automatically)
-                                let is_usd = !state.file_format.map(|f| f.is_gltf()).unwrap_or(false);
+                                let is_usd =
+                                    !state.file_format.map(|f| f.is_gltf()).unwrap_or(false);
                                 if is_usd {
                                     ui.separator();
 
-                                    let color_selected = state.texture_mode == TextureMode::ColorOnly;
+                                    let color_selected =
+                                        state.texture_mode == TextureMode::ColorOnly;
                                     if ui
                                         .selectable_label(color_selected, "Load Color Channel")
                                         .clicked()
@@ -2498,7 +2568,8 @@ fn main() {
                                     }
 
                                     let pbr_selected = state.texture_mode == TextureMode::FullPbr;
-                                    if ui.selectable_label(pbr_selected, "Load Full PBR").clicked() {
+                                    if ui.selectable_label(pbr_selected, "Load Full PBR").clicked()
+                                    {
                                         // Toggle: if already selected, switch to None to unload textures
                                         state.texture_mode = if pbr_selected {
                                             TextureMode::None
@@ -2816,103 +2887,62 @@ fn main() {
                     }
                 }
 
-                // Handle debug shading state changes (only for static USD scenes)
-                if let SceneContent::Static { ref mut models } = state.scene.content {
-                    if state.debug_shading.enabled && !state.debug_shading_was_enabled {
-                        // Debug shading just enabled - cache current materials
-                        state.material_cache = models
-                            .iter()
-                            .map(|(_, model)| MaterialCache::from_material(&model.material))
-                            .collect();
-                    } else if !state.debug_shading.enabled && state.debug_shading_was_enabled {
-                        // Debug shading just disabled - restore materials from cache
-                        for (i, (_, model)) in models.iter_mut().enumerate() {
-                            if let Some(cache) = state.material_cache.get(i) {
-                                cache.restore_to_material(&mut model.material);
+                // Handle debug shading state changes for both USD and glTF scenes
+                match &mut state.scene.content {
+                    SceneContent::Static { ref mut models } => {
+                        if state.debug_shading.enabled && !state.debug_shading_was_enabled {
+                            // Cache materials when debug shading is enabled
+                            state.material_cache = models
+                                .iter()
+                                .map(|(_, m)| MaterialCache::from_material(&m.material))
+                                .collect();
+                        } else if !state.debug_shading.enabled && state.debug_shading_was_enabled {
+                            // Restore materials when debug shading is disabled
+                            for (i, (_, m)) in models.iter_mut().enumerate() {
+                                if let Some(cache) = state.material_cache.get(i) {
+                                    cache.restore_to_material(&mut m.material);
+                                }
+                            }
+                        }
+                        // Apply debug shading overrides
+                        if state.debug_shading.enabled {
+                            for (i, (_, m)) in models.iter_mut().enumerate() {
+                                if let Some(cache) = state.material_cache.get(i) {
+                                    state
+                                        .debug_shading
+                                        .apply_to_material(&mut m.material, cache);
+                                }
+                            }
+                        }
+                    }
+                    SceneContent::Animated { ref mut model, .. } => {
+                        if state.debug_shading.enabled && !state.debug_shading_was_enabled {
+                            // Cache materials when debug shading is enabled
+                            state.material_cache = model
+                                .iter()
+                                .map(|part| MaterialCache::from_material(&part.material))
+                                .collect();
+                        } else if !state.debug_shading.enabled && state.debug_shading_was_enabled {
+                            // Restore materials when debug shading is disabled
+                            for (i, part) in model.iter_mut().enumerate() {
+                                if let Some(cache) = state.material_cache.get(i) {
+                                    cache.restore_to_material(&mut part.material);
+                                }
+                            }
+                        }
+                        // Apply debug shading overrides
+                        if state.debug_shading.enabled {
+                            for (i, part) in model.iter_mut().enumerate() {
+                                if let Some(cache) = state.material_cache.get(i) {
+                                    state
+                                        .debug_shading
+                                        .apply_to_material(&mut part.material, cache);
+                                }
                             }
                         }
                     }
                 }
                 state.debug_shading_was_enabled = state.debug_shading.enabled;
-
-                // Apply debug shading if enabled (non-destructive using cache, only for static scenes)
-                if state.debug_shading.enabled {
-                    if let SceneContent::Static { ref mut models } = state.scene.content {
-                        let to_srgb =
-                            |c: f32| -> u8 { (c.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8 };
-
-                        for (i, (_, model)) in models.iter_mut().enumerate() {
-                            let cache = state.material_cache.get(i);
-
-                            // Restore from cache first, then apply overrides
-                            if let Some(c) = cache {
-                                // Diffuse/Albedo
-                                if state.debug_shading.use_diffuse_map {
-                                    model.material.albedo_texture = c.albedo_texture.clone();
-                                    model.material.albedo = c.albedo;
-                                } else {
-                                    model.material.albedo_texture = None;
-                                    model.material.albedo = Srgba::new(
-                                        to_srgb(state.debug_shading.diffuse_color[0]),
-                                        to_srgb(state.debug_shading.diffuse_color[1]),
-                                        to_srgb(state.debug_shading.diffuse_color[2]),
-                                        (state.debug_shading.opacity * 255.0) as u8,
-                                    );
-                                }
-
-                                // Metallic/Roughness
-                                if state.debug_shading.use_metallic_map
-                                    && state.debug_shading.use_roughness_map
-                                {
-                                    model.material.metallic_roughness_texture =
-                                        c.metallic_roughness_texture.clone();
-                                    model.material.metallic = c.metallic;
-                                    model.material.roughness = c.roughness;
-                                } else {
-                                    model.material.metallic_roughness_texture = None;
-                                    if !state.debug_shading.use_metallic_map {
-                                        model.material.metallic = state.debug_shading.metallic;
-                                    } else {
-                                        model.material.metallic = c.metallic;
-                                    }
-                                    if !state.debug_shading.use_roughness_map {
-                                        model.material.roughness = state.debug_shading.roughness;
-                                    } else {
-                                        model.material.roughness = c.roughness;
-                                    }
-                                }
-
-                                // Normal
-                                if state.debug_shading.use_normal_map {
-                                    model.material.normal_texture = c.normal_texture.clone();
-                                } else {
-                                    model.material.normal_texture = None;
-                                }
-
-                                // Occlusion
-                                if state.debug_shading.use_occlusion_map {
-                                    model.material.occlusion_texture = c.occlusion_texture.clone();
-                                } else {
-                                    model.material.occlusion_texture = None;
-                                }
-
-                                // Emissive
-                                if state.debug_shading.use_emissive_map {
-                                    model.material.emissive_texture = c.emissive_texture.clone();
-                                    model.material.emissive = c.emissive;
-                                } else {
-                                    model.material.emissive_texture = None;
-                                    model.material.emissive = Srgba::new(
-                                        to_srgb(state.debug_shading.emissive_color[0]),
-                                        to_srgb(state.debug_shading.emissive_color[1]),
-                                        to_srgb(state.debug_shading.emissive_color[2]),
-                                        255,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
 
                 let screen = frame_input.screen();
 
