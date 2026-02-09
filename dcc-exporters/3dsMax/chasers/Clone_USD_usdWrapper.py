@@ -114,17 +114,28 @@ class MeshWrapperChaser(maxUsd.ExportChaser):
             if not Usd.ModelAPI(parent_prim).GetKind():
                 Usd.ModelAPI(parent_prim).SetKind("component")
 
-# I renamed the chaser ID slightly so it's clear in the logs what version is running
-maxUsd.ExportChaser.Register(MeshWrapperChaser, "wrapMesh", "Wrap Meshes (Keep Root)", "Wraps meshes in Xforms but preserves Root.",)
+# Register the chaser for Simple Mode exports
+maxUsd.ExportChaser.Register(
+    MeshWrapperChaser,
+    "simpleMode",
+    "Simple Mode (Wrap Meshes)",
+    "Wraps meshes in Xforms with Kind=subcomponent. Use for simple batch exports."
+)
 
-def wrapMeshContext():
-    extraArgs = {}    
-    extraArgs['chaser']  = ['wrapMesh']
-    extraArgs['chaserNames']  = ['wrapMesh']
-    return extraArgs
+def simpleModeContext():
+    """Export context for Simple Mode - wraps meshes under Xforms."""
+    return {
+        'chaser': ['simpleMode'],
+        'chaserNames': ['simpleMode']
+    }
 
 registeredContexts = maxUsd.JobContextRegistry.ListJobContexts()
-if 'wrapMeshContext' not in registeredContexts:
-    maxUsd.JobContextRegistry.RegisterExportJobContext("wrapMeshContext", "Wrap Meshes (Keep Root)", "Wraps meshes without removing root.", wrapMeshContext)
+if 'simpleModeContext' not in registeredContexts:
+    maxUsd.JobContextRegistry.RegisterExportJobContext(
+        "simpleModeContext",
+        "Simple Mode",
+        "Simple export mode - wraps meshes under Xforms with Kind=subcomponent",
+        simpleModeContext
+    )
 
-print("Registered Mesh Wrapper (Keep Root)")
+print("Registered Simple Mode Chaser")
