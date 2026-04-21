@@ -8,8 +8,10 @@ use std::time::Instant;
 use std::{env, fs};
 
 mod ui;
+mod usd_writer;
 use ui::animation::AnimationController;
 use ui::asset_library::AssetLibrary;
+use ui::stager::Stager;
 use ui::theme::configure_theme;
 
 use anyhow::{bail, Result};
@@ -73,6 +75,431 @@ impl UpAxis {
             "Z" => UpAxis::Z,
             _ => UpAxis::Y,
         }
+    }
+}
+
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+
+/// Maximum hierarchy depth to prevent stack overflow from malformed files.
+const MAX_HIERARCHY_DEPTH: usize = 100;
+
+/// Composed USD data that resolves references to external files.
+///
+/// This implements the AbstractData trait and handles USD composition
+/// by loading referenced layers and composing their data.
+struct ComposedData {
+    /// The primary layer data.
+    primary: Box<dyn AbstractData>,
+    /// Base directory for resolving relative asset paths.
+    base_dir: PathBuf,
+    /// Cached references: maps prim path to (referenced prim path, layer index).
+    reference_map: HashMap<String, Vec<(sdf::Path, usize)>>,
+    /// Loaded reference layers.
+    reference_layers: Vec<Box<dyn AbstractData>>,
+    /// Files already loaded (for circular reference detection).
+    loaded_files: HashSet<PathBuf>,
+}
+
+impl ComposedData {
+    /// Create a new composed data from a primary layer.
+    fn new(primary: Box<dyn AbstractData>, base_dir: PathBuf, primary_path: PathBuf) -> Self {
+        let mut loaded_files = HashSet::new();
+        loaded_files.insert(primary_path);
+        Self {
+            primary,
+            base_dir,
+            reference_map: HashMap::new(),
+            reference_layers: Vec::new(),
+            loaded_files,
+        }
+    }
+
+    /// Resolve all references in the scene.
+    fn resolve_references(&mut self) -> Result<()> {
+        // Collect all prims with references
+        let root = sdf::Path::abs_root();
+        let mut prims_to_check = vec![root];
+        let mut references_to_load: Vec<(String, sdf::Reference)> = Vec::new();
+
+        while let Some(prim_path) = prims_to_check.pop() {
+            // Debug: show what we're checking
+            println!("Checking prim for references: {}", prim_path.as_str());
+            
+            // Check for references on this prim
+            if let Ok(val) = self.primary.get(&prim_path, "references") {
+                if let Some(list_op) = val.into_owned().try_as_reference_list_op() {
+                    // Collect all references from the list op
+                    for reference in list_op
+                        .explicit_items
+                        .into_iter()
+                        .chain(list_op.prepended_items)
+                        .chain(list_op.appended_items)
+                    {
+                        if !reference.asset_path.is_empty() {
+                            println!("  Found reference: {} -> {}", prim_path.as_str(), reference.asset_path);
+                            references_to_load.push((prim_path.as_str().to_string(), reference));
+                        }
+                    }
+                }
+            }
+
+            // Get children and add them to the check list
+            if let Ok(val) = self.primary.get(&prim_path, "primChildren") {
+                if let Some(children) = val.into_owned().try_as_token_vec() {
+                    println!("  Children: {:?}", children);
+                    let prim_str = prim_path.as_str();
+                    let is_root = prim_str == "/";
+                    for child_name in children {
+                        let child_path = if is_root {
+                            sdf::path(format!("/{child_name}"))
+                        } else {
+                            sdf::path(format!("{prim_str}/{child_name}"))
+                        };
+                        if let Ok(path) = child_path {
+                            prims_to_check.push(path);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Load referenced files
+        for (prim_path_str, reference) in references_to_load {
+            let asset_path = &reference.asset_path;
+            let ref_prim_path = reference.prim_path;
+
+            // Resolve asset path relative to base directory
+            let resolved_path = self.base_dir.join(asset_path);
+
+            // Canonicalize for circular reference detection
+            let canonical_path = resolved_path.canonicalize().unwrap_or_else(|_| resolved_path.clone());
+
+            if self.loaded_files.contains(&canonical_path) {
+                // Skip circular references
+                continue;
+            }
+
+            if !resolved_path.exists() {
+                eprintln!(
+                    "Warning: Referenced file not found: {} (resolved to {})",
+                    asset_path,
+                    resolved_path.display()
+                );
+                continue;
+            }
+
+            // Load the referenced file
+            match load_usd_file(&resolved_path) {
+                Ok(layer) => {
+                    // Determine the target prim in the referenced file
+                    let target_path = if ref_prim_path.as_str().is_empty() {
+                        // When no prim path is specified, use the defaultPrim from the referenced file
+                        let root = sdf::Path::abs_root();
+                        let default_prim = layer.get(&root, "defaultPrim")
+                            .ok()
+                            .and_then(|v| v.into_owned().try_as_token())
+                            .and_then(|name| sdf::path(format!("/{}", name)).ok());
+                        
+                        if let Some(dp) = default_prim {
+                            println!("Loaded reference: {} -> {} (using defaultPrim: {})", 
+                                     prim_path_str, 
+                                     resolved_path.display(),
+                                     dp.as_str());
+                            dp
+                        } else {
+                            // Fallback: try to find a prim with the same name as the referencing prim
+                            let ref_name = prim_path_str.split('/').last().unwrap_or("");
+                            let same_name_prim = sdf::path(format!("/{}", ref_name)).ok();
+                            
+                            if let Some(snp) = same_name_prim.filter(|p| layer.has_spec(p)) {
+                                println!("Loaded reference: {} -> {} (using matching prim: {})", 
+                                         prim_path_str, 
+                                         resolved_path.display(),
+                                         snp.as_str());
+                                snp
+                            } else {
+                                // Ultimate fallback: use root and map children directly
+                                println!("Loaded reference: {} -> {} (using root)", 
+                                         prim_path_str, 
+                                         resolved_path.display());
+                                sdf::Path::abs_root()
+                            }
+                        }
+                    } else {
+                        println!("Loaded reference: {} -> {} (explicit prim: {})", 
+                                 prim_path_str, 
+                                 resolved_path.display(),
+                                 ref_prim_path.as_str());
+                        ref_prim_path
+                    };
+
+                    self.loaded_files.insert(canonical_path);
+                    let layer_index = self.reference_layers.len();
+                    self.reference_layers.push(layer);
+
+                    self.reference_map
+                        .entry(prim_path_str)
+                        .or_default()
+                        .push((target_path, layer_index));
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to load referenced file {}: {}", asset_path, e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Translate a local path to a referenced path.
+    /// Returns None if the local path is not under the reference base.
+    /// Handles both prim paths (/Foo/Bar) and property paths (/Foo/Bar.property).
+    fn translate_path(&self, local_path: &sdf::Path, ref_base: &sdf::Path, ref_target: &sdf::Path) -> Option<sdf::Path> {
+        let local_str = local_path.as_str();
+        let base_str = ref_base.as_str();
+        
+        // Check if this is a property path (contains '.')
+        // Property paths look like: /Prim/Path.propertyName or /Prim/Path.propertyName:subprop
+        let (prim_path_str, property_suffix) = if let Some(dot_pos) = local_str.find('.') {
+            (&local_str[..dot_pos], Some(&local_str[dot_pos..]))
+        } else {
+            (local_str, None)
+        };
+
+        // Exact match - the referenced prim itself
+        if prim_path_str == base_str {
+            let translated = ref_target.as_str().to_string();
+            let final_path = if let Some(prop) = property_suffix {
+                format!("{}{}", translated, prop)
+            } else {
+                translated
+            };
+            return sdf::path(final_path).ok();
+        }
+
+        // Check if prim_path is a descendant of ref_base
+        // Must match as a path component boundary, not just string prefix
+        let is_descendant = if base_str == "/" {
+            // Root references everything
+            true
+        } else {
+            // Must be base_str followed by "/" or be exact match (handled above)
+            prim_path_str.starts_with(base_str) && prim_path_str[base_str.len()..].starts_with('/')
+        };
+
+        if !is_descendant {
+            return None;
+        }
+
+        // Extract the suffix (path components after the base)
+        let prim_suffix = if base_str == "/" {
+            prim_path_str // Keep full path for root base
+        } else {
+            &prim_path_str[base_str.len()..] // Includes leading '/'
+        };
+
+        let target_str = ref_target.as_str();
+        let new_prim_path = if target_str == "/" {
+            prim_suffix.to_string()
+        } else {
+            format!("{}{}", target_str, prim_suffix)
+        };
+        
+        // Reattach property suffix if present
+        let final_path = if let Some(prop) = property_suffix {
+            format!("{}{}", new_prim_path, prop)
+        } else {
+            new_prim_path
+        };
+
+        sdf::path(final_path).ok()
+    }
+}
+
+impl sdf::AbstractData for ComposedData {
+    fn has_spec(&self, path: &sdf::Path) -> bool {
+        if self.primary.has_spec(path) {
+            return true;
+        }
+
+        // Check referenced layers
+        for (ref_base, refs) in &self.reference_map {
+            if let Ok(ref_base_path) = sdf::path(ref_base.clone()) {
+                for (ref_target, layer_idx) in refs {
+                    if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target) {
+                        if self.reference_layers[*layer_idx].has_spec(&translated) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    fn has_field(&self, path: &sdf::Path, field: &str) -> bool {
+        if self.primary.has_field(path, field) {
+            return true;
+        }
+
+        // Check referenced layers
+        for (ref_base, refs) in &self.reference_map {
+            if let Ok(ref_base_path) = sdf::path(ref_base.clone()) {
+                for (ref_target, layer_idx) in refs {
+                    if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target) {
+                        if self.reference_layers[*layer_idx].has_field(&translated, field) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    fn spec_type(&self, path: &sdf::Path) -> Option<sdf::SpecType> {
+        if let Some(ty) = self.primary.spec_type(path) {
+            return Some(ty);
+        }
+
+        // Check referenced layers
+        for (ref_base, refs) in &self.reference_map {
+            if let Ok(ref_base_path) = sdf::path(ref_base.clone()) {
+                for (ref_target, layer_idx) in refs {
+                    if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target) {
+                        if let Some(ty) = self.reference_layers[*layer_idx].spec_type(&translated) {
+                            return Some(ty);
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn get(&self, path: &sdf::Path, field: &str) -> Result<Cow<'_, sdf::Value>> {
+        // For primChildren, we need to merge from ALL layers (primary + referenced)
+        // This must be handled specially before the early return for primary layer
+        if field == "primChildren" {
+            let mut children: Vec<String> = Vec::new();
+
+            // Get children from primary
+            if let Ok(val) = self.primary.get(path, field) {
+                if let Some(primary_children) = val.into_owned().try_as_token_vec() {
+                    children.extend(primary_children);
+                }
+            }
+
+            // Get children from referenced layers
+            for (ref_base, refs) in &self.reference_map {
+                if let Ok(ref_base_path) = sdf::path(ref_base.clone()) {
+                    for (ref_target, layer_idx) in refs {
+                        if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target) {
+                            if let Ok(val) = self.reference_layers[*layer_idx].get(&translated, field) {
+                                if let Some(ref_children) = val.into_owned().try_as_token_vec() {
+                                    for child in ref_children {
+                                        if !children.contains(&child) {
+                                            children.push(child);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !children.is_empty() {
+                return Ok(Cow::Owned(sdf::Value::TokenVec(children)));
+            }
+            // Fall through to check other sources if no children found
+        }
+
+        // For non-primChildren fields, primary layer wins (local opinions)
+        if self.primary.has_field(path, field) {
+            return self.primary.get(path, field);
+        }
+
+        // Check referenced layers for other fields
+        for (ref_base, refs) in &self.reference_map {
+            if let Ok(ref_base_path) = sdf::path(ref_base.clone()) {
+                for (ref_target, layer_idx) in refs {
+                    if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target) {
+                        if self.reference_layers[*layer_idx].has_field(&translated, field) {
+                            return self.reference_layers[*layer_idx].get(&translated, field);
+                        }
+                    }
+                }
+            }
+        }
+
+        bail!("No field found for path '{path}' and field '{field}'")
+    }
+
+    fn list(&self, path: &sdf::Path) -> Option<Vec<String>> {
+        let mut fields: Vec<String> = Vec::new();
+
+        // Get fields from primary
+        if let Some(primary_fields) = self.primary.list(path) {
+            fields.extend(primary_fields);
+        }
+
+        // Get fields from referenced layers
+        for (ref_base, refs) in &self.reference_map {
+            if let Ok(ref_base_path) = sdf::path(ref_base.clone()) {
+                for (ref_target, layer_idx) in refs {
+                    if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target) {
+                        if let Some(ref_fields) = self.reference_layers[*layer_idx].list(&translated) {
+                            for f in ref_fields {
+                                if !fields.contains(&f) {
+                                    fields.push(f);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if fields.is_empty() {
+            None
+        } else {
+            Some(fields)
+        }
+    }
+}
+
+/// Load a USD file without composition (for loading referenced layers).
+fn load_usd_file(file_path: &Path) -> Result<Box<dyn AbstractData>> {
+    let extension = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match extension.as_str() {
+        "usda" => {
+            // Use a thread with larger stack size to handle deeply nested USD files
+            // The USDA parser uses recursion for nested prims which can overflow on complex files
+            let file_path = file_path.to_path_buf();
+            let handle = std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024) // 8MB stack
+                .spawn(move || TextReader::read(&file_path))
+                .expect("Failed to spawn parser thread");
+            
+            let reader = handle.join().map_err(|_| anyhow::anyhow!("Parser thread panicked"))??;
+            Ok(Box::new(reader))
+        }
+        "usdc" | "usd" => {
+            let file = fs::File::open(file_path)?;
+            let data = CrateData::open(file, false)?;
+            Ok(Box::new(data))
+        }
+        _ => bail!("Unsupported file extension: {extension}. Use .usda, .usdc, or .usd"),
     }
 }
 
@@ -1127,13 +1554,12 @@ fn try_extract_meshes(
         Some(p) => p,
         None => return Vec::new(),
     };
-    let positions: Vec<f32> = match points
-        .clone()
-        .try_as_vec_3f()
-        .or_else(|| points.try_as_float_vec())
-    {
-        Some(p) => p,
-        None => return Vec::new(),
+    let positions: Vec<f32> = if let Some(v) = points.try_as_vec_3f_vec_ref() {
+        v.as_flattened().to_vec()
+    } else if let Some(v) = points.try_as_float_vec_ref() {
+        v.clone()
+    } else {
+        return Vec::new();
     };
 
     if positions.is_empty() {
@@ -1141,20 +1567,20 @@ fn try_extract_meshes(
     }
 
     // Try multiple normal property names (3ds Max uses primvars:normals)
-    let normals = get_property(data, path, "normals")
+    let normals: Option<Vec<f32>> = get_property(data, path, "normals")
         .or_else(|| get_property(data, path, "primvars:normals"))
-        .and_then(|v| v.try_as_vec_3f());
+        .and_then(|v| v.try_as_vec_3f_vec_ref().map(|r| r.as_flattened().to_vec()));
 
     // Get normal indices for face-varying interpolation
     let normal_indices =
         get_property(data, path, "primvars:normals:indices").and_then(|v| v.try_as_int_vec());
 
     // Try to get UVs from common primvar names
-    let raw_uvs = get_property(data, path, "primvars:st")
+    let raw_uvs: Option<Vec<f32>> = get_property(data, path, "primvars:st")
         .or_else(|| get_property(data, path, "primvars:st0"))
         .or_else(|| get_property(data, path, "primvars:uv"))
         .or_else(|| get_property(data, path, "primvars:UVMap"))
-        .and_then(|v| v.try_as_vec_2f());
+        .and_then(|v| v.try_as_vec_2f_vec_ref().map(|r| r.as_flattened().to_vec()));
 
     // Get UV indices for faceVarying interpolation
     let uv_indices = get_property(data, path, "primvars:st:indices")
@@ -1354,79 +1780,160 @@ fn try_extract_meshes(
     }]
 }
 
-/// Extract meshes from USD data recursively, accumulating transforms.
-fn extract_meshes_recursive(
-    data: &mut dyn AbstractData,
-    root: &sdf::Path,
-    parent_transform: Matrix4,
-) -> Result<Vec<UsdMesh>> {
+/// Extract meshes from USD data iteratively to avoid stack overflow.
+fn extract_meshes(data: &mut dyn AbstractData, root: &sdf::Path) -> Result<Vec<UsdMesh>> {
     let mut meshes = Vec::new();
-    let children = match data.get(root, "primChildren") {
-        Ok(val) => val.into_owned().try_as_token_vec().unwrap_or_default(),
-        Err(_) => return Ok(meshes),
-    };
+    // Stack stores (path, parent_transform, depth)
+    let mut stack = vec![(root.clone(), Matrix4::identity(), 0)];
+    let mut visited = HashSet::new(); // Prevent infinite loops from cycles
 
-    let root_str = root.as_str();
-    let is_root = root_str == "/";
+    // Safety limit for hierarchy depth
+    const MAX_DEPTH: usize = 100;
 
-    for child_name in children {
-        let child_path = if is_root {
-            sdf::path(format!("/{child_name}"))?
-        } else {
-            sdf::path(format!("{root_str}/{child_name}"))?
-        };
+    while let Some((path, parent_transform, depth)) = stack.pop() {
+        if depth > MAX_DEPTH {
+            continue;
+        }
+
+        // Cycle detection using path string
+        let path_str = path.as_str().to_string();
+        if !visited.insert(path_str) {
+            continue;
+        }
 
         // Get local transform and combine with parent
-        let local_transform = get_local_transform(data, &child_path);
+        let local_transform = get_local_transform(data, &path);
         let world_transform = parent_transform.mul(&local_transform);
 
-        // Extract meshes (may return multiple for multi-material meshes)
-        let extracted = try_extract_meshes(data, &child_path, &child_name, world_transform);
-        meshes.extend(extracted);
-        meshes.extend(extract_meshes_recursive(
-            data,
-            &child_path,
-            world_transform,
-        )?);
+        // Try to extract mesh from current prim (except root which is usually just a container)
+        if !path.as_str().eq("/") {
+            let name = path.as_str().split('/').last().unwrap_or("mesh");
+            let extracted = try_extract_meshes(data, &path, name, world_transform);
+            meshes.extend(extracted);
+        }
+
+        // Enqueue children
+        if let Ok(val) = data.get(&path, "primChildren") {
+            if let Some(children) = val.into_owned().try_as_token_vec() {
+                let path_str = path.as_str();
+                let is_root = path_str == "/";
+                
+                for child_name in children {
+                    let child_path = if is_root {
+                        sdf::path(format!("/{child_name}"))
+                    } else {
+                        sdf::path(format!("{path_str}/{child_name}"))
+                    };
+
+                    if let Ok(cp) = child_path {
+                        stack.push((cp, world_transform, depth + 1));
+                    }
+                }
+            }
+        }
     }
+
     Ok(meshes)
 }
 
-/// Extract meshes from USD data recursively.
-fn extract_meshes(data: &mut dyn AbstractData, root: &sdf::Path) -> Result<Vec<UsdMesh>> {
-    extract_meshes_recursive(data, root, Matrix4::identity())
-}
-
 /// Build hierarchy cache from USD data (called once on load).
-fn build_hierarchy_cache(data: &mut dyn AbstractData, path: &sdf::Path) -> HierarchyNode {
-    let path_str = path.as_str();
-    let name = path_str.split('/').next_back().unwrap_or("/");
-    let name = if name.is_empty() { "/" } else { name };
-
-    let children_names = data
-        .get(path, "primChildren")
-        .ok()
-        .and_then(|v| v.into_owned().try_as_token_vec())
-        .unwrap_or_default();
-
-    let is_root = path_str == "/";
-    let children: Vec<HierarchyNode> = children_names
-        .into_iter()
-        .filter_map(|child_name| {
-            let child_path = if is_root {
-                sdf::path(format!("/{child_name}")).ok()
-            } else {
-                sdf::path(format!("{path_str}/{child_name}")).ok()
-            };
-            child_path.map(|p| build_hierarchy_cache(data, &p))
-        })
-        .collect();
-
-    HierarchyNode {
-        path: path.clone(),
-        name: name.to_string(),
-        children,
+/// Uses an iterative approach to avoid stack overflow on deep hierarchies.
+fn build_hierarchy_cache(data: &mut dyn AbstractData, root_path: &sdf::Path) -> HierarchyNode {
+    // Use iterative approach with explicit stack to prevent stack overflow.
+    // We build a flat list of nodes, then construct the tree in a second pass.
+    
+    struct StackEntry {
+        path: sdf::Path,
+        depth: usize,
     }
+    
+    // First pass: collect all nodes with their paths and depths
+    let mut all_nodes: Vec<(sdf::Path, String, usize)> = Vec::new(); // (path, name, depth)
+    let mut stack = vec![StackEntry { path: root_path.clone(), depth: 0 }];
+    let mut visited = HashSet::new();
+    
+    while let Some(entry) = stack.pop() {
+        // Depth limit to prevent infinite loops from malformed files
+        if entry.depth > MAX_HIERARCHY_DEPTH {
+            continue;
+        }
+        
+        let path_str = entry.path.as_str().to_string();
+        
+        // Prevent cycles
+        if !visited.insert(path_str.clone()) {
+            continue;
+        }
+        
+        let name = path_str.split('/').next_back().unwrap_or("/");
+        let name = if name.is_empty() { "/" } else { name };
+        
+        all_nodes.push((entry.path.clone(), name.to_string(), entry.depth));
+        
+        // Get children and add them to stack
+        let children_names = data
+            .get(&entry.path, "primChildren")
+            .ok()
+            .and_then(|v| v.into_owned().try_as_token_vec())
+            .unwrap_or_default();
+        
+        let is_root = entry.path.as_str() == "/";
+        
+        // Add children in reverse order so they're processed in forward order when popped
+        for child_name in children_names.into_iter().rev() {
+            let child_path = if is_root {
+                sdf::path(format!("/{child_name}"))
+            } else {
+                sdf::path(format!("{}/{child_name}", entry.path.as_str()))
+            };
+            
+            if let Ok(cp) = child_path {
+                stack.push(StackEntry { path: cp, depth: entry.depth + 1 });
+            }
+        }
+    }
+    
+    // Second pass: build the tree from collected nodes
+    // We process nodes in reverse (deepest first) to build children before parents
+    let mut node_map: HashMap<String, HierarchyNode> = HashMap::new();
+    
+    // Sort by depth descending so we process children before parents
+    all_nodes.sort_by(|a, b| b.2.cmp(&a.2));
+    
+    for (path, name, _depth) in all_nodes {
+        let path_str = path.as_str().to_string();
+        
+        // Collect children for this node
+        let children: Vec<HierarchyNode> = data
+            .get(&path, "primChildren")
+            .ok()
+            .and_then(|v| v.into_owned().try_as_token_vec())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|child_name| {
+                let child_path_str = if path_str == "/" {
+                    format!("/{child_name}")
+                } else {
+                    format!("{path_str}/{child_name}")
+                };
+                node_map.remove(&child_path_str)
+            })
+            .collect();
+        
+        node_map.insert(path_str, HierarchyNode {
+            path,
+            name,
+            children,
+        });
+    }
+    
+    // Return the root node
+    let root_str = root_path.as_str().to_string();
+    node_map.remove(&root_str).unwrap_or_else(|| HierarchyNode {
+        path: root_path.clone(),
+        name: "/".to_string(),
+        children: Vec::new(),
+    })
 }
 
 /// Update inspector cache for selected prim.
@@ -1448,26 +1955,24 @@ fn update_inspector_cache(data: &mut dyn AbstractData, path: &sdf::Path) -> Insp
     }
 }
 
-/// Load USD file.
+/// Load USD file with composition (resolves references to external files).
 fn open_usd(file_path: &Path) -> Result<Box<dyn AbstractData>> {
-    let extension = file_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+    println!("Loading primary file: {}", file_path.display());
+    let primary = load_usd_file(file_path)?;
+    println!("Primary file parsed successfully");
 
-    match extension.as_str() {
-        "usda" => {
-            let reader = TextReader::read(file_path)?;
-            Ok(Box::new(reader))
-        }
-        "usdc" | "usd" => {
-            let file = fs::File::open(file_path)?;
-            let data = CrateData::open(file, false)?;
-            Ok(Box::new(data))
-        }
-        _ => bail!("Unsupported file extension: {extension}. Use .usda, .usdc, or .usd"),
-    }
+    // Get base directory for resolving relative asset paths
+    let base_dir = file_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let mut composed = ComposedData::new(primary, base_dir, file_path.to_path_buf());
+    println!("Resolving references...");
+    composed.resolve_references()?;
+    println!("References resolved successfully");
+
+    Ok(Box::new(composed))
 }
 
 /// Transform Z-up coordinates to Y-up: (x, y, z) → (x, z, -y)
@@ -2142,6 +2647,8 @@ struct AppState {
     animation_controller: AnimationController,
     /// Current file format (USD or glTF).
     file_format: Option<FileFormat>,
+    /// Stage assembler for creating/editing USD stages.
+    stager: Stager,
 }
 
 /// Load an environment map from an image file.
@@ -2389,6 +2896,7 @@ fn main() {
         debug_shading_was_enabled: false,
         animation_controller: AnimationController::default(),
         file_format: None,
+        stager: Stager::new(),
     };
     let mut last_frame_time = Instant::now();
 
@@ -2479,6 +2987,15 @@ fn main() {
                         {
                             state.asset_library.toggle();
                         }
+                        // Toggle stager with Tab key
+                        if !gui_context.wants_keyboard_input()
+                            && gui_context.input(|i| i.key_pressed(egui::Key::Tab))
+                        {
+                            state.stager.toggle();
+                        }
+
+                        // Render stager window
+                        state.stager.render(gui_context);
                         egui::SidePanel::left("hierarchy")
                             .default_width(200.0)
                             .min_width(150.0)
@@ -2727,7 +3244,14 @@ fn main() {
                                 }
 
                                 ui.separator();
-                                ui.label("Press SPACE for Asset Library");
+
+                                // Stager button
+                                if ui.button("⚙ Stager").clicked() {
+                                    state.stager.toggle();
+                                }
+
+                                ui.separator();
+                                ui.label("SPACE: Library | TAB: Stager");
                             });
                         });
 
