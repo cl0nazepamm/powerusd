@@ -2183,10 +2183,12 @@ dependencies = [
  "image",
  "openusd",
  "quick-xml 0.37.5",
+ "raw-window-handle 0.5.2",
  "rayon",
  "rfd",
  "three-d",
  "three-d-asset",
+ "windows-sys 0.59.0",
  "winit",
 ]
 

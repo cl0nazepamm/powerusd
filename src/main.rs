@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"]
 //! Advanced USD and glTF viewer with GUI hierarchy and inspector.
 //!
 //! This application demonstrates a complete 3D asset viewing experience using egui,
@@ -20,11 +21,22 @@ use openusd::{
     usda::TextReader,
     usdc::CrateData,
 };
+#[cfg(windows)]
+use raw_window_handle::{HasRawWindowHandle, RawWindowHandle, Win32WindowHandle};
 use rayon::prelude::*;
 use three_d::*;
 use three_d_asset::io::load_and_deserialize;
 use ui::gltf::scene_to_model;
 use winit::event::{Event as WinitEvent, WindowEvent};
+#[cfg(windows)]
+use winit::platform::windows::WindowBuilderExtWindows;
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{HWND, RECT};
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, IsWindow, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
+};
 
 /// Supported file formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,9 +135,6 @@ impl ComposedData {
         let mut references_to_load: Vec<(String, sdf::Reference)> = Vec::new();
 
         while let Some(prim_path) = prims_to_check.pop() {
-            // Debug: show what we're checking
-            println!("Checking prim for references: {}", prim_path.as_str());
-            
             // Check for references on this prim
             if let Ok(val) = self.primary.get(&prim_path, "references") {
                 if let Some(list_op) = val.into_owned().try_as_reference_list_op() {
@@ -137,7 +146,6 @@ impl ComposedData {
                         .chain(list_op.appended_items)
                     {
                         if !reference.asset_path.is_empty() {
-                            println!("  Found reference: {} -> {}", prim_path.as_str(), reference.asset_path);
                             references_to_load.push((prim_path.as_str().to_string(), reference));
                         }
                     }
@@ -147,7 +155,6 @@ impl ComposedData {
             // Get children and add them to the check list
             if let Ok(val) = self.primary.get(&prim_path, "primChildren") {
                 if let Some(children) = val.into_owned().try_as_token_vec() {
-                    println!("  Children: {:?}", children);
                     let prim_str = prim_path.as_str();
                     let is_root = prim_str == "/";
                     for child_name in children {
@@ -173,7 +180,9 @@ impl ComposedData {
             let resolved_path = self.base_dir.join(asset_path);
 
             // Canonicalize for circular reference detection
-            let canonical_path = resolved_path.canonicalize().unwrap_or_else(|_| resolved_path.clone());
+            let canonical_path = resolved_path
+                .canonicalize()
+                .unwrap_or_else(|_| resolved_path.clone());
 
             if self.loaded_files.contains(&canonical_path) {
                 // Skip circular references
@@ -196,41 +205,25 @@ impl ComposedData {
                     let target_path = if ref_prim_path.as_str().is_empty() {
                         // When no prim path is specified, use the defaultPrim from the referenced file
                         let root = sdf::Path::abs_root();
-                        let default_prim = layer.get(&root, "defaultPrim")
+                        let default_prim = layer
+                            .get(&root, "defaultPrim")
                             .ok()
                             .and_then(|v| v.into_owned().try_as_token())
                             .and_then(|name| sdf::path(format!("/{}", name)).ok());
-                        
+
                         if let Some(dp) = default_prim {
-                            println!("Loaded reference: {} -> {} (using defaultPrim: {})", 
-                                     prim_path_str, 
-                                     resolved_path.display(),
-                                     dp.as_str());
                             dp
                         } else {
-                            // Fallback: try to find a prim with the same name as the referencing prim
                             let ref_name = prim_path_str.split('/').last().unwrap_or("");
                             let same_name_prim = sdf::path(format!("/{}", ref_name)).ok();
-                            
+
                             if let Some(snp) = same_name_prim.filter(|p| layer.has_spec(p)) {
-                                println!("Loaded reference: {} -> {} (using matching prim: {})", 
-                                         prim_path_str, 
-                                         resolved_path.display(),
-                                         snp.as_str());
                                 snp
                             } else {
-                                // Ultimate fallback: use root and map children directly
-                                println!("Loaded reference: {} -> {} (using root)", 
-                                         prim_path_str, 
-                                         resolved_path.display());
                                 sdf::Path::abs_root()
                             }
                         }
                     } else {
-                        println!("Loaded reference: {} -> {} (explicit prim: {})", 
-                                 prim_path_str, 
-                                 resolved_path.display(),
-                                 ref_prim_path.as_str());
                         ref_prim_path
                     };
 
@@ -244,7 +237,10 @@ impl ComposedData {
                         .push((target_path, layer_index));
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to load referenced file {}: {}", asset_path, e);
+                    eprintln!(
+                        "Warning: Failed to load referenced file {}: {}",
+                        asset_path, e
+                    );
                 }
             }
         }
@@ -255,10 +251,15 @@ impl ComposedData {
     /// Translate a local path to a referenced path.
     /// Returns None if the local path is not under the reference base.
     /// Handles both prim paths (/Foo/Bar) and property paths (/Foo/Bar.property).
-    fn translate_path(&self, local_path: &sdf::Path, ref_base: &sdf::Path, ref_target: &sdf::Path) -> Option<sdf::Path> {
+    fn translate_path(
+        &self,
+        local_path: &sdf::Path,
+        ref_base: &sdf::Path,
+        ref_target: &sdf::Path,
+    ) -> Option<sdf::Path> {
         let local_str = local_path.as_str();
         let base_str = ref_base.as_str();
-        
+
         // Check if this is a property path (contains '.')
         // Property paths look like: /Prim/Path.propertyName or /Prim/Path.propertyName:subprop
         let (prim_path_str, property_suffix) = if let Some(dot_pos) = local_str.find('.') {
@@ -305,7 +306,7 @@ impl ComposedData {
         } else {
             format!("{}{}", target_str, prim_suffix)
         };
-        
+
         // Reattach property suffix if present
         let final_path = if let Some(prop) = property_suffix {
             format!("{}{}", new_prim_path, prop)
@@ -327,7 +328,8 @@ impl sdf::AbstractData for ComposedData {
         for (ref_base, refs) in &self.reference_map {
             if let Ok(ref_base_path) = sdf::path(ref_base.clone()) {
                 for (ref_target, layer_idx) in refs {
-                    if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target) {
+                    if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target)
+                    {
                         if self.reference_layers[*layer_idx].has_spec(&translated) {
                             return true;
                         }
@@ -348,7 +350,8 @@ impl sdf::AbstractData for ComposedData {
         for (ref_base, refs) in &self.reference_map {
             if let Ok(ref_base_path) = sdf::path(ref_base.clone()) {
                 for (ref_target, layer_idx) in refs {
-                    if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target) {
+                    if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target)
+                    {
                         if self.reference_layers[*layer_idx].has_field(&translated, field) {
                             return true;
                         }
@@ -369,7 +372,8 @@ impl sdf::AbstractData for ComposedData {
         for (ref_base, refs) in &self.reference_map {
             if let Ok(ref_base_path) = sdf::path(ref_base.clone()) {
                 for (ref_target, layer_idx) in refs {
-                    if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target) {
+                    if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target)
+                    {
                         if let Some(ty) = self.reference_layers[*layer_idx].spec_type(&translated) {
                             return Some(ty);
                         }
@@ -398,8 +402,12 @@ impl sdf::AbstractData for ComposedData {
             for (ref_base, refs) in &self.reference_map {
                 if let Ok(ref_base_path) = sdf::path(ref_base.clone()) {
                     for (ref_target, layer_idx) in refs {
-                        if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target) {
-                            if let Ok(val) = self.reference_layers[*layer_idx].get(&translated, field) {
+                        if let Some(translated) =
+                            self.translate_path(path, &ref_base_path, ref_target)
+                        {
+                            if let Ok(val) =
+                                self.reference_layers[*layer_idx].get(&translated, field)
+                            {
                                 if let Some(ref_children) = val.into_owned().try_as_token_vec() {
                                     for child in ref_children {
                                         if !children.contains(&child) {
@@ -428,7 +436,8 @@ impl sdf::AbstractData for ComposedData {
         for (ref_base, refs) in &self.reference_map {
             if let Ok(ref_base_path) = sdf::path(ref_base.clone()) {
                 for (ref_target, layer_idx) in refs {
-                    if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target) {
+                    if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target)
+                    {
                         if self.reference_layers[*layer_idx].has_field(&translated, field) {
                             return self.reference_layers[*layer_idx].get(&translated, field);
                         }
@@ -452,8 +461,11 @@ impl sdf::AbstractData for ComposedData {
         for (ref_base, refs) in &self.reference_map {
             if let Ok(ref_base_path) = sdf::path(ref_base.clone()) {
                 for (ref_target, layer_idx) in refs {
-                    if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target) {
-                        if let Some(ref_fields) = self.reference_layers[*layer_idx].list(&translated) {
+                    if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target)
+                    {
+                        if let Some(ref_fields) =
+                            self.reference_layers[*layer_idx].list(&translated)
+                        {
                             for f in ref_fields {
                                 if !fields.contains(&f) {
                                     fields.push(f);
@@ -490,8 +502,10 @@ fn load_usd_file(file_path: &Path) -> Result<Box<dyn AbstractData>> {
                 .stack_size(8 * 1024 * 1024) // 8MB stack
                 .spawn(move || TextReader::read(&file_path))
                 .expect("Failed to spawn parser thread");
-            
-            let reader = handle.join().map_err(|_| anyhow::anyhow!("Parser thread panicked"))??;
+
+            let reader = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("Parser thread panicked"))??;
             Ok(Box::new(reader))
         }
         "usdc" | "usd" => {
@@ -733,17 +747,12 @@ fn load_materialx_from_dir(dir: &Path) -> std::collections::HashMap<String, UsdP
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "mtlx") {
-                println!("Loading MaterialX: {}", path.display());
                 let mats = load_materialx(&path);
                 for (name, mat) in mats {
                     all_materials.insert(name, mat);
                 }
             }
         }
-    }
-
-    if !all_materials.is_empty() {
-        println!("Loaded {} MaterialX materials", all_materials.len());
     }
 
     all_materials
@@ -1487,10 +1496,7 @@ fn get_mesh_material(
 
     Some(match shader_type {
         ShaderType::UsdPreviewSurface => extract_preview_surface(data, &shader_path),
-        ShaderType::MaterialXStandardSurface => {
-            println!("Found MaterialX standard_surface: {}", shader_path.as_str());
-            extract_materialx_surface(data, &shader_path)
-        }
+        ShaderType::MaterialXStandardSurface => extract_materialx_surface(data, &shader_path),
     })
 }
 
@@ -1817,7 +1823,7 @@ fn extract_meshes(data: &mut dyn AbstractData, root: &sdf::Path) -> Result<Vec<U
             if let Some(children) = val.into_owned().try_as_token_vec() {
                 let path_str = path.as_str();
                 let is_root = path_str == "/";
-                
+
                 for child_name in children {
                     let child_path = if is_root {
                         sdf::path(format!("/{child_name}"))
@@ -1841,44 +1847,47 @@ fn extract_meshes(data: &mut dyn AbstractData, root: &sdf::Path) -> Result<Vec<U
 fn build_hierarchy_cache(data: &mut dyn AbstractData, root_path: &sdf::Path) -> HierarchyNode {
     // Use iterative approach with explicit stack to prevent stack overflow.
     // We build a flat list of nodes, then construct the tree in a second pass.
-    
+
     struct StackEntry {
         path: sdf::Path,
         depth: usize,
     }
-    
+
     // First pass: collect all nodes with their paths and depths
     let mut all_nodes: Vec<(sdf::Path, String, usize)> = Vec::new(); // (path, name, depth)
-    let mut stack = vec![StackEntry { path: root_path.clone(), depth: 0 }];
+    let mut stack = vec![StackEntry {
+        path: root_path.clone(),
+        depth: 0,
+    }];
     let mut visited = HashSet::new();
-    
+
     while let Some(entry) = stack.pop() {
         // Depth limit to prevent infinite loops from malformed files
         if entry.depth > MAX_HIERARCHY_DEPTH {
             continue;
         }
-        
+
         let path_str = entry.path.as_str().to_string();
-        
+
         // Prevent cycles
         if !visited.insert(path_str.clone()) {
             continue;
         }
-        
+
         let name = path_str.split('/').next_back().unwrap_or("/");
         let name = if name.is_empty() { "/" } else { name };
-        
+
         all_nodes.push((entry.path.clone(), name.to_string(), entry.depth));
-        
+
         // Get children and add them to stack
         let children_names = data
             .get(&entry.path, "primChildren")
             .ok()
             .and_then(|v| v.into_owned().try_as_token_vec())
             .unwrap_or_default();
-        
+
         let is_root = entry.path.as_str() == "/";
-        
+
         // Add children in reverse order so they're processed in forward order when popped
         for child_name in children_names.into_iter().rev() {
             let child_path = if is_root {
@@ -1886,23 +1895,26 @@ fn build_hierarchy_cache(data: &mut dyn AbstractData, root_path: &sdf::Path) -> 
             } else {
                 sdf::path(format!("{}/{child_name}", entry.path.as_str()))
             };
-            
+
             if let Ok(cp) = child_path {
-                stack.push(StackEntry { path: cp, depth: entry.depth + 1 });
+                stack.push(StackEntry {
+                    path: cp,
+                    depth: entry.depth + 1,
+                });
             }
         }
     }
-    
+
     // Second pass: build the tree from collected nodes
     // We process nodes in reverse (deepest first) to build children before parents
     let mut node_map: HashMap<String, HierarchyNode> = HashMap::new();
-    
+
     // Sort by depth descending so we process children before parents
     all_nodes.sort_by(|a, b| b.2.cmp(&a.2));
-    
+
     for (path, name, _depth) in all_nodes {
         let path_str = path.as_str().to_string();
-        
+
         // Collect children for this node
         let children: Vec<HierarchyNode> = data
             .get(&path, "primChildren")
@@ -1919,14 +1931,17 @@ fn build_hierarchy_cache(data: &mut dyn AbstractData, root_path: &sdf::Path) -> 
                 node_map.remove(&child_path_str)
             })
             .collect();
-        
-        node_map.insert(path_str, HierarchyNode {
-            path,
-            name,
-            children,
-        });
+
+        node_map.insert(
+            path_str,
+            HierarchyNode {
+                path,
+                name,
+                children,
+            },
+        );
     }
-    
+
     // Return the root node
     let root_str = root_path.as_str().to_string();
     node_map.remove(&root_str).unwrap_or_else(|| HierarchyNode {
@@ -1957,20 +1972,15 @@ fn update_inspector_cache(data: &mut dyn AbstractData, path: &sdf::Path) -> Insp
 
 /// Load USD file with composition (resolves references to external files).
 fn open_usd(file_path: &Path) -> Result<Box<dyn AbstractData>> {
-    println!("Loading primary file: {}", file_path.display());
     let primary = load_usd_file(file_path)?;
-    println!("Primary file parsed successfully");
 
-    // Get base directory for resolving relative asset paths
     let base_dir = file_path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
 
     let mut composed = ComposedData::new(primary, base_dir, file_path.to_path_buf());
-    println!("Resolving references...");
     composed.resolve_references()?;
-    println!("References resolved successfully");
 
     Ok(Box::new(composed))
 }
@@ -2358,8 +2368,6 @@ fn create_scene(
 
 /// Load a glTF/GLB file and create a Scene with animations.
 fn load_gltf_file(path: &Path, context: &Context) -> Result<(Scene, f32)> {
-    println!("Loading glTF: {}", path.display());
-
     // Load as Scene and convert with our fixed hierarchy transform handling
     let gltf_scene: three_d_asset::Scene = load_and_deserialize(path)?;
     let cpu_model = scene_to_model(gltf_scene);
@@ -2437,12 +2445,7 @@ fn load_gltf_file(path: &Path, context: &Context) -> Result<(Scene, f32)> {
         .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or(0.0);
 
-    println!(
-        "Loaded glTF: {} geometries, {} animations, duration: {:.2}s",
-        cpu_model.geometries.len(),
-        animation_names.len(),
-        duration
-    );
+
 
     let axes = Axes::new(context, scene_size * 0.001, scene_size * 0.01);
 
@@ -2653,13 +2656,10 @@ struct AppState {
 
 /// Load an environment map from an image file.
 fn load_environment_map(context: &Context, path: &Path) -> Option<EnvironmentMap> {
-    println!("Loading environment map: {}", path.display());
-
     let cpu_texture = load_environment_texture(path)?;
     let skybox = Skybox::new_from_equirectangular(context, &cpu_texture);
     let light = AmbientLight::new_with_environment(context, 1.0, Srgba::WHITE, skybox.texture());
 
-    println!("Environment map loaded successfully");
     Some(EnvironmentMap { skybox, light })
 }
 
@@ -2674,7 +2674,6 @@ fn load_asset_file(
     window: &winit::window::Window,
 ) {
     let format = FileFormat::from_path(path);
-    println!("Loading: {} (format: {:?})", path.display(), format);
 
     match format {
         Some(FileFormat::Gltf) | Some(FileFormat::Glb) => {
@@ -2712,17 +2711,11 @@ fn load_asset_file(
             match open_usd(path) {
                 Ok(mut new_stage) => {
                     let up_axis = get_up_axis(new_stage.as_mut());
-                    if up_axis == UpAxis::Z {
-                        println!("Detected Z-up scene (3ds Max), applying coordinate conversion");
-                    }
                     let hierarchy =
                         build_hierarchy_cache(new_stage.as_mut(), &sdf::Path::abs_root());
                     let mut meshes =
                         match extract_meshes(new_stage.as_mut(), &sdf::Path::abs_root()) {
-                            Ok(m) => {
-                                println!("Loaded {} meshes", m.len());
-                                m
-                            }
+                            Ok(m) => m,
                             Err(e) => {
                                 eprintln!("Error extracting meshes: {}", e);
                                 Vec::new()
@@ -2818,6 +2811,318 @@ fn show_hierarchy_cached(
     }
 }
 
+enum ShellCommand {
+    Thumbnail {
+        file: PathBuf,
+        out: PathBuf,
+        size: u32,
+    },
+    PreviewChild {
+        parent_hwnd: isize,
+        file: PathBuf,
+    },
+}
+
+fn parse_shell_command(args: &[String]) -> Result<Option<ShellCommand>> {
+    if args.len() <= 1 {
+        return Ok(None);
+    }
+
+    match args[1].as_str() {
+        "--thumbnail" => {
+            let mut file = args.get(2).map(PathBuf::from);
+            let mut out = None;
+            let mut size = 256u32;
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--file" => {
+                        i += 1;
+                        file = args.get(i).map(PathBuf::from);
+                    }
+                    "--out" => {
+                        i += 1;
+                        out = args.get(i).map(PathBuf::from);
+                    }
+                    "--size" => {
+                        i += 1;
+                        let raw = args
+                            .get(i)
+                            .ok_or_else(|| anyhow::anyhow!("missing --size value"))?;
+                        size = raw.parse::<u32>()?;
+                    }
+                    other if file.is_none() => file = Some(PathBuf::from(other)),
+                    other => bail!("unknown --thumbnail argument: {other}"),
+                }
+                i += 1;
+            }
+
+            let file = file.ok_or_else(|| anyhow::anyhow!("--thumbnail requires a USD file"))?;
+            let out = out.ok_or_else(|| anyhow::anyhow!("--thumbnail requires --out <png>"))?;
+            Ok(Some(ShellCommand::Thumbnail {
+                file,
+                out,
+                size: size.clamp(16, 2048),
+            }))
+        }
+        "--preview-child" => {
+            let raw_hwnd = args
+                .get(2)
+                .ok_or_else(|| anyhow::anyhow!("--preview-child requires a parent HWND"))?;
+            let parent_hwnd = raw_hwnd.parse::<isize>()?;
+            let mut file = None;
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--file" => {
+                        i += 1;
+                        file = args.get(i).map(PathBuf::from);
+                    }
+                    other if file.is_none() => file = Some(PathBuf::from(other)),
+                    other => bail!("unknown --preview-child argument: {other}"),
+                }
+                i += 1;
+            }
+            let file =
+                file.ok_or_else(|| anyhow::anyhow!("--preview-child requires a USD file"))?;
+            Ok(Some(ShellCommand::PreviewChild { parent_hwnd, file }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn load_shell_scene(
+    context: &Context,
+    file_path: &Path,
+    texture_mode: TextureMode,
+) -> Result<Scene> {
+    let format = FileFormat::from_path(file_path)
+        .ok_or_else(|| anyhow::anyhow!("unsupported file extension: {}", file_path.display()))?;
+
+    if format.is_gltf() {
+        let (scene, _) = load_gltf_file(file_path, context)?;
+        return Ok(scene);
+    }
+
+    let mut stage = open_usd(file_path)?;
+    let up_axis = get_up_axis(stage.as_mut());
+    let mut meshes = extract_meshes(stage.as_mut(), &sdf::Path::abs_root())?;
+    let base_dir = file_path.parent().map(|p| p.to_path_buf());
+
+    if let Some(ref dir) = base_dir {
+        let mtlx_materials = load_materialx_from_dir(dir);
+        if !mtlx_materials.is_empty() {
+            apply_materialx_to_meshes(&mut meshes, &mtlx_materials, stage.as_mut());
+        }
+    }
+
+    Ok(create_scene(
+        context,
+        &meshes,
+        up_axis,
+        texture_mode,
+        base_dir.as_deref(),
+    ))
+}
+
+fn render_basic_scene(
+    target: &RenderTarget<'_>,
+    scene: &Scene,
+    camera: &Camera,
+    lights: &[&dyn Light],
+) {
+    let scene_objects: Vec<&dyn Object> = match &scene.content {
+        SceneContent::Static { models } => models.iter().map(|(_, m)| m as &dyn Object).collect(),
+        SceneContent::Animated { model, .. } => model.iter().map(|m| m as &dyn Object).collect(),
+    };
+
+    target.clear(ClearState::color_and_depth(0.15, 0.15, 0.18, 1.0, 1.0));
+    target.render(
+        camera,
+        scene_objects
+            .into_iter()
+            .chain(std::iter::once(&scene.axes as &dyn Object)),
+        lights,
+    );
+}
+
+fn run_thumbnail(file_path: &Path, out_path: &Path, size: u32) -> Result<()> {
+    let event_loop = winit::event_loop::EventLoop::new();
+    let window = winit::window::WindowBuilder::new()
+        .with_title("PowerUSD Thumbnail")
+        .with_visible(false)
+        .with_inner_size(winit::dpi::LogicalSize::new(size, size))
+        .build(&event_loop)?;
+    let context = WindowedContext::from_winit_window(&window, SurfaceSettings::default())?;
+
+    let scene = load_shell_scene(&context, file_path, TextureMode::ColorOnly)?;
+    let viewport = Viewport::new_at_origo(size, size);
+    let z_near = (scene.size * 0.01).max(0.1);
+    let z_far = scene.size * 100.0;
+    let camera = Camera::new_perspective(
+        viewport,
+        scene.center + vec3(scene.size * 2.0, scene.size, scene.size * 2.0),
+        scene.center,
+        vec3(0.0, 1.0, 0.0),
+        degrees(45.0),
+        z_near,
+        z_far,
+    );
+    let light0 = DirectionalLight::new(&context, 3.0, Srgba::WHITE, vec3(-1.0, -1.0, -1.0));
+    let light1 = DirectionalLight::new(&context, 1.5, Srgba::WHITE, vec3(1.0, 1.0, 1.0));
+    let ambient = AmbientLight::new(&context, 0.08, Srgba::WHITE);
+
+    let screen = RenderTarget::screen(&context, size, size);
+    render_basic_scene(&screen, &scene, &camera, &[&light0, &light1, &ambient]);
+    let pixels = screen.read_color::<[u8; 4]>();
+    let rgba = pixels.into_iter().flatten().collect::<Vec<_>>();
+    let img = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(size, size, rgba)
+        .ok_or_else(|| anyhow::anyhow!("failed to read thumbnail pixels"))?;
+    img.save(out_path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn hwnd_is_valid(hwnd: isize) -> bool {
+    unsafe { IsWindow(hwnd as HWND) != 0 }
+}
+
+#[cfg(windows)]
+fn client_size(hwnd: isize) -> Option<(u32, u32)> {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    let ok = unsafe { GetClientRect(hwnd as HWND, &mut rect) };
+    if ok == 0 {
+        return None;
+    }
+    let width = (rect.right - rect.left).max(1) as u32;
+    let height = (rect.bottom - rect.top).max(1) as u32;
+    Some((width, height))
+}
+
+#[cfg(windows)]
+fn child_hwnd(window: &winit::window::Window) -> Option<HWND> {
+    match window.raw_window_handle() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd as HWND),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn resize_child_to_parent(window: &winit::window::Window, parent_hwnd: isize) {
+    let Some((width, height)) = client_size(parent_hwnd) else {
+        return;
+    };
+    let Some(hwnd) = child_hwnd(window) else {
+        return;
+    };
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            width as i32,
+            height as i32,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+#[cfg(windows)]
+fn run_preview_child(parent_hwnd: isize, file_path: &Path) -> Result<()> {
+    if !hwnd_is_valid(parent_hwnd) {
+        bail!("invalid Explorer preview parent HWND: {parent_hwnd}");
+    }
+
+    let (width, height) = client_size(parent_hwnd).unwrap_or((900, 600));
+    let event_loop = winit::event_loop::EventLoop::new();
+    let mut parent_handle = Win32WindowHandle::empty();
+    parent_handle.hwnd = parent_hwnd as HWND as *mut _;
+    let parent_handle = RawWindowHandle::Win32(parent_handle);
+
+    let mut window_builder = winit::window::WindowBuilder::new()
+        .with_title("PowerUSD Preview")
+        .with_decorations(false)
+        .with_visible(true)
+        .with_inner_size(winit::dpi::LogicalSize::new(width, height))
+        .with_drag_and_drop(false)
+        .with_skip_taskbar(true);
+    window_builder = unsafe { window_builder.with_parent_window(Some(parent_handle)) };
+
+    let window = window_builder.build(&event_loop)?;
+    let context = WindowedContext::from_winit_window(&window, SurfaceSettings::default())?;
+    resize_child_to_parent(&window, parent_hwnd);
+
+    let mut scene = load_shell_scene(&context, file_path, TextureMode::ColorOnly)?;
+    let z_near = (scene.size * 0.01).max(0.1);
+    let z_far = scene.size * 100.0;
+    let mut camera = Camera::new_perspective(
+        Viewport::new_at_origo(width, height),
+        scene.center + vec3(scene.size * 2.0, scene.size, scene.size * 2.0),
+        scene.center,
+        vec3(0.0, 1.0, 0.0),
+        degrees(45.0),
+        z_near,
+        z_far,
+    );
+    let mut control = OrbitControl::new(scene.center, scene.size * 0.1, scene.size * 10.0);
+    let light0 = DirectionalLight::new(&context, 3.0, Srgba::WHITE, vec3(-1.0, -1.0, -1.0));
+    let light1 = DirectionalLight::new(&context, 1.5, Srgba::WHITE, vec3(1.0, 1.0, 1.0));
+    let ambient = AmbientLight::new(&context, 0.08, Srgba::WHITE);
+    let mut frame_input_generator = FrameInputGenerator::from_winit_window(&window);
+
+    event_loop.run(move |event, _, control_flow| match event {
+        WinitEvent::MainEventsCleared => {
+            if !hwnd_is_valid(parent_hwnd) {
+                control_flow.set_exit();
+                return;
+            }
+            resize_child_to_parent(&window, parent_hwnd);
+            window.request_redraw();
+            control_flow.set_poll();
+        }
+        WinitEvent::RedrawRequested(_) => {
+            let mut frame_input = frame_input_generator.generate(&context);
+            camera.set_viewport(frame_input.viewport);
+            control.handle_events(&mut camera, &mut frame_input.events);
+
+            if let SceneContent::Animated { ref mut model, .. } = scene.content {
+                model.animate((frame_input.accumulated_time * 0.001) as f32);
+            }
+
+            let screen = frame_input.screen();
+            render_basic_scene(&screen, &scene, &camera, &[&light0, &light1, &ambient]);
+            context.swap_buffers().unwrap();
+        }
+        WinitEvent::WindowEvent { ref event, .. } => {
+            frame_input_generator.handle_winit_window_event(event);
+            match event {
+                WindowEvent::Resized(physical_size) => {
+                    context.resize(*physical_size);
+                }
+                WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                    context.resize(**new_inner_size);
+                }
+                WindowEvent::CloseRequested => {
+                    control_flow.set_exit();
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    });
+}
+
+#[cfg(not(windows))]
+fn run_preview_child(_parent_hwnd: isize, _file_path: &Path) -> Result<()> {
+    bail!("--preview-child is only supported on Windows")
+}
+
 fn main() {
     // Limit rayon threads to half of available cores to prevent CPU lockout
     let num_threads = (std::thread::available_parallelism()
@@ -2831,6 +3136,27 @@ fn main() {
         .ok();
 
     let args: Vec<String> = env::args().collect();
+    match parse_shell_command(&args) {
+        Ok(Some(ShellCommand::Thumbnail { file, out, size })) => {
+            if let Err(e) = run_thumbnail(&file, &out, size) {
+                eprintln!("PowerUSD thumbnail failed: {e:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Ok(Some(ShellCommand::PreviewChild { parent_hwnd, file })) => {
+            if let Err(e) = run_preview_child(parent_hwnd, &file) {
+                eprintln!("PowerUSD preview failed: {e:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("PowerUSD argument error: {e:#}");
+            std::process::exit(2);
+        }
+    }
     let initial_file: Option<PathBuf> = args.get(1).map(PathBuf::from);
 
     let event_loop = winit::event_loop::EventLoop::new();
@@ -2850,9 +3176,6 @@ fn main() {
                 let mut m =
                     extract_meshes(stage.as_mut(), &sdf::Path::abs_root()).unwrap_or_default();
                 let dir = path.parent().map(|p| p.to_path_buf());
-                if axis == UpAxis::Z {
-                    println!("Detected Z-up scene (3ds Max), applying coordinate conversion");
-                }
                 // Load MaterialX materials from the same directory
                 if let Some(ref base_dir) = dir {
                     let mtlx_materials = load_materialx_from_dir(base_dir);

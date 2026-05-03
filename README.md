@@ -26,7 +26,8 @@ I made this so I can stop dealing with .blend or .max files people are selling a
 - Persistent library paths (saved to config)
 
 ### 3D Viewer
-- USD/USDC support
+- USD/USDC/USDA support
+- GLB support (with animations)
 - Drag & drop file loading
 - Orbit camera controls
 - Z-up to Y-up conversion (3ds Max support)

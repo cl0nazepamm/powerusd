@@ -192,17 +192,21 @@ fn asset_card(
     // Render content first (non-interactive)
     if ui.is_rect_visible(rect) {
         let content_rect = rect.shrink(4.0);
-        let mut content_ui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
-        // Important: Intersect with parent clip rect (scroll area) to avoid drawing outside
-        content_ui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
-        content(&mut content_ui);
+        let clip_rect = content_rect.intersect(ui.clip_rect());
+
+        // Only create child UI if we have a valid visible area
+        if clip_rect.is_positive() {
+            let mut content_ui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
+            content_ui.set_clip_rect(clip_rect);
+            content(&mut content_ui);
+        }
     }
 
     // Create an interactive overlay on top that captures all clicks
     let response = ui.interact(rect, id, egui::Sense::click());
 
     // Draw hover/selection background
-    if ui.is_rect_visible(rect) {
+    if ui.is_rect_visible(rect) && ui.clip_rect().is_positive() {
         let visuals = ui.style().interact_selectable(&response, false);
         let bg_color = if response.hovered() {
             ui.visuals().widgets.hovered.bg_fill
@@ -228,8 +232,11 @@ fn asset_card(
 
 /// Helper to render an image cropped to fill the target size (object-fit: cover).
 fn paint_cropped_image(ui: &mut egui::Ui, texture: &ThumbnailTexture, target_size: Vec2) {
+    if !ui.clip_rect().is_positive() {
+        return;
+    }
     let image_size = Vec2::from(texture.size);
-    if image_size.x == 0.0 || image_size.y == 0.0 {
+    if image_size.x <= 0.0 || image_size.y <= 0.0 {
         return;
     }
 
@@ -238,14 +245,12 @@ fn paint_cropped_image(ui: &mut egui::Ui, texture: &ThumbnailTexture, target_siz
 
     let uv_rect = if image_aspect > target_aspect {
         // Image is wider than target: Crop width (keep full height)
-        // We want to map [0,1] target width to [u_min, u_max] source width
-        // The visible portion of the image has width = target_aspect / image_aspect relative to full image width
-        let visible_width_fraction = target_aspect / image_aspect;
+        let visible_width_fraction = (target_aspect / image_aspect).clamp(0.0, 1.0);
         let x_offset = (1.0 - visible_width_fraction) / 2.0;
         Rect::from_min_size(pos2(x_offset, 0.0), vec2(visible_width_fraction, 1.0))
     } else {
         // Image is taller than target: Crop height (keep full width)
-        let visible_height_fraction = image_aspect / target_aspect;
+        let visible_height_fraction = (image_aspect / target_aspect).clamp(0.0, 1.0);
         let y_offset = (1.0 - visible_height_fraction) / 2.0;
         Rect::from_min_size(pos2(0.0, y_offset), vec2(1.0, visible_height_fraction))
     };
@@ -669,7 +674,7 @@ impl AssetLibrary {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                // ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0); // Removed to prevent panic
 
                 if self.current_dir.is_none() {
                     // Show library roots
