@@ -17,7 +17,7 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Gdi::{
     CreateDIBSection, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
 };
-use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
+use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl, IStream, STREAM_SEEK_SET};
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::Ole::{
     IObjectWithSite, IObjectWithSite_Impl, IOleWindow, IOleWindow_Impl,
@@ -33,7 +33,8 @@ use windows::Win32::UI::Shell::{
     IThumbnailProvider, IThumbnailProvider_Impl, WTS_ALPHATYPE, WTSAT_ARGB,
 };
 use windows::Win32::UI::Shell::PropertiesSystem::{
-    IInitializeWithFile, IInitializeWithFile_Impl,
+    IInitializeWithFile, IInitializeWithFile_Impl, IInitializeWithStream,
+    IInitializeWithStream_Impl,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindow, RegisterClassW, SetWindowLongPtrW,
@@ -53,6 +54,17 @@ const EXTENSIONS: &[&str] = &[".usd", ".usda", ".usdc", ".usdz"];
 
 static DLL_REFCOUNT: AtomicU32 = AtomicU32::new(0);
 static MODULE_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+
+fn log(msg: &str) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("powerusd_shell.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{}] {}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(), msg);
+    }
+}
 
 fn error(hr: HRESULT) -> Error {
     Error::from(hr)
@@ -125,7 +137,7 @@ impl IClassFactory_Impl for ClassFactory_Impl {
     }
 }
 
-#[implement(IInitializeWithFile, IThumbnailProvider)]
+#[implement(IInitializeWithFile, IInitializeWithStream, IThumbnailProvider)]
 struct ThumbnailProvider {
     file_path: Mutex<Option<PathBuf>>,
 }
@@ -148,6 +160,15 @@ impl Drop for ThumbnailProvider {
 impl IInitializeWithFile_Impl for ThumbnailProvider_Impl {
     fn Initialize(&self, pszFilePath: &PCWSTR, _grfMode: u32) -> windows::core::Result<()> {
         let path = pcwstr_to_path(*pszFilePath).ok_or_else(|| error(E_POINTER))?;
+        *self.file_path.lock().unwrap() = Some(path);
+        Ok(())
+    }
+}
+
+impl IInitializeWithStream_Impl for ThumbnailProvider_Impl {
+    fn Initialize(&self, pstream: Option<&IStream>, _grfMode: u32) -> windows::core::Result<()> {
+        let stream = pstream.ok_or_else(|| error(E_POINTER))?;
+        let path = stream_to_temp_file(stream, "thumb")?;
         *self.file_path.lock().unwrap() = Some(path);
         Ok(())
     }
@@ -189,6 +210,7 @@ impl IThumbnailProvider_Impl for ThumbnailProvider_Impl {
 
 #[implement(
     IInitializeWithFile,
+    IInitializeWithStream,
     IObjectWithSite,
     IOleWindow,
     IPreviewHandler,
@@ -278,6 +300,18 @@ impl Drop for PreviewHandler {
 impl IInitializeWithFile_Impl for PreviewHandler_Impl {
     fn Initialize(&self, pszFilePath: &PCWSTR, _grfMode: u32) -> windows::core::Result<()> {
         let path = pcwstr_to_path(*pszFilePath).ok_or_else(|| error(E_POINTER))?;
+        log(&format!("Preview::InitWithFile: {}", path.display()));
+        *self.file_path.lock().unwrap() = Some(path);
+        Ok(())
+    }
+}
+
+impl IInitializeWithStream_Impl for PreviewHandler_Impl {
+    fn Initialize(&self, pstream: Option<&IStream>, _grfMode: u32) -> windows::core::Result<()> {
+        log("Preview::InitWithStream called");
+        let stream = pstream.ok_or_else(|| error(E_POINTER))?;
+        let path = stream_to_temp_file(stream, "preview")?;
+        log(&format!("Preview::InitWithStream saved to: {}", path.display()));
         *self.file_path.lock().unwrap() = Some(path);
         Ok(())
     }
@@ -315,6 +349,7 @@ impl IOleWindow_Impl for PreviewHandler_Impl {
 
 impl IPreviewHandler_Impl for PreviewHandler_Impl {
     fn SetWindow(&self, hwnd: HWND, prc: *const RECT) -> windows::core::Result<()> {
+        log(&format!("Preview::SetWindow hwnd={:?}", hwnd.0));
         if prc.is_null() {
             return Err(error(E_POINTER));
         }
@@ -347,20 +382,35 @@ impl IPreviewHandler_Impl for PreviewHandler_Impl {
     }
 
     fn DoPreview(&self) -> windows::core::Result<()> {
+        log("Preview::DoPreview called");
         self.stop_child();
         let file = self
             .file_path
             .lock()
             .unwrap()
             .clone()
-            .ok_or_else(|| error(E_FAIL))?;
-        let hwnd_host = self.ensure_host()?;
+            .ok_or_else(|| {
+                log("Preview::DoPreview FAIL: no file_path set");
+                error(E_FAIL)
+            })?;
+        log(&format!("Preview::DoPreview file={}", file.display()));
+        let hwnd_host = self.ensure_host().map_err(|e| {
+            log(&format!("Preview::DoPreview FAIL: ensure_host: {:?}", e));
+            e
+        })?;
+        log(&format!("Preview::DoPreview host_hwnd={:?}", hwnd_host.0));
+        let exe = find_powerusd_exe();
+        log(&format!("Preview::DoPreview exe={:?}", exe));
         let child = spawn_powerusd(&[
             OsString::from("--preview-child"),
             OsString::from((hwnd_host.0 as usize).to_string()),
             OsString::from("--file"),
             file.into_os_string(),
-        ])?;
+        ]).map_err(|e| {
+            log(&format!("Preview::DoPreview FAIL: spawn: {:?}", e));
+            e
+        })?;
+        log(&format!("Preview::DoPreview spawned pid={}", child.id()));
         *self.child.lock().unwrap() = Some(child);
         Ok(())
     }
@@ -442,8 +492,10 @@ pub unsafe extern "system" fn DllGetClassObject(
     *ppv = null_mut();
 
     let kind = if *rclsid == CLSID_POWERUSD_THUMBNAIL {
+        log("DllGetClassObject: Thumbnail");
         ClassKind::Thumbnail
     } else if *rclsid == CLSID_POWERUSD_PREVIEW {
+        log("DllGetClassObject: Preview");
         ClassKind::Preview
     } else {
         return CLASS_E_CLASSNOTAVAILABLE;
@@ -622,6 +674,52 @@ fn register_server() -> windows::core::Result<()> {
     let thumbnail_iid = "{e357fccd-a995-4576-b01f-234630154e96}";
     let preview_iid = "{8895b1c6-b41f-4c1c-a562-0d564250836f}";
     for ext in EXTENSIONS {
+        let progid = format!("PowerUSD{}", ext.trim_start_matches('.'));
+
+        write_registry_string(
+            HKEY_CURRENT_USER,
+            &format!("Software\\Classes\\{}", ext),
+            "",
+            &progid,
+        )?;
+        write_registry_string(
+            HKEY_CURRENT_USER,
+            &format!("Software\\Classes\\{}", ext),
+            "PerceivedType",
+            "document",
+        )?;
+        write_registry_string(
+            HKEY_CURRENT_USER,
+            &format!("Software\\Classes\\{}", progid),
+            "",
+            "PowerUSD Scene File",
+        )?;
+        write_registry_string(
+            HKEY_CURRENT_USER,
+            &format!("Software\\Classes\\{}\\shellex\\{}", progid, thumbnail_iid),
+            "",
+            CLSID_POWERUSD_THUMBNAIL_STR,
+        )?;
+        write_registry_string(
+            HKEY_CURRENT_USER,
+            &format!("Software\\Classes\\{}\\shellex\\{}", progid, preview_iid),
+            "",
+            CLSID_POWERUSD_PREVIEW_STR,
+        )?;
+        // SystemFileAssociations — always honored by Explorer on Win11
+        write_registry_string(
+            HKEY_CURRENT_USER,
+            &format!("Software\\Classes\\SystemFileAssociations\\{}\\shellex\\{}", ext, thumbnail_iid),
+            "",
+            CLSID_POWERUSD_THUMBNAIL_STR,
+        )?;
+        write_registry_string(
+            HKEY_CURRENT_USER,
+            &format!("Software\\Classes\\SystemFileAssociations\\{}\\shellex\\{}", ext, preview_iid),
+            "",
+            CLSID_POWERUSD_PREVIEW_STR,
+        )?;
+        // Direct extension registration as fallback
         write_registry_string(
             HKEY_CURRENT_USER,
             &format!("Software\\Classes\\{}\\shellex\\{}", ext, thumbnail_iid),
@@ -671,6 +769,11 @@ fn unregister_server() -> windows::core::Result<()> {
     let thumbnail_iid = "{e357fccd-a995-4576-b01f-234630154e96}";
     let preview_iid = "{8895b1c6-b41f-4c1c-a562-0d564250836f}";
     for ext in EXTENSIONS {
+        let progid = format!("PowerUSD{}", ext.trim_start_matches('.'));
+        let _ = delete_registry_tree(
+            HKEY_CURRENT_USER,
+            &format!("Software\\Classes\\{}", progid),
+        );
         let _ = delete_registry_tree(
             HKEY_CURRENT_USER,
             &format!("Software\\Classes\\{}\\shellex\\{}", ext, thumbnail_iid),
@@ -678,6 +781,14 @@ fn unregister_server() -> windows::core::Result<()> {
         let _ = delete_registry_tree(
             HKEY_CURRENT_USER,
             &format!("Software\\Classes\\{}\\shellex\\{}", ext, preview_iid),
+        );
+        let _ = delete_registry_tree(
+            HKEY_CURRENT_USER,
+            &format!("Software\\Classes\\SystemFileAssociations\\{}\\shellex\\{}", ext, thumbnail_iid),
+        );
+        let _ = delete_registry_tree(
+            HKEY_CURRENT_USER,
+            &format!("Software\\Classes\\SystemFileAssociations\\{}\\shellex\\{}", ext, preview_iid),
         );
     }
     Ok(())
@@ -836,6 +947,44 @@ fn pcwstr_to_path(value: PCWSTR) -> Option<PathBuf> {
 
 fn wide(value: &str) -> Vec<u16> {
     OsStr::new(value).encode_wide().chain(std::iter::once(0)).collect()
+}
+
+fn stream_to_temp_file(stream: &IStream, prefix: &str) -> windows::core::Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!(
+        "powerusd_{}_{}_{}.usd",
+        prefix,
+        unsafe { GetCurrentProcessId() },
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+
+    unsafe {
+        stream.Seek(0i64, STREAM_SEEK_SET, None)?;
+    }
+
+    let mut data = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let mut read = 0u32;
+        unsafe {
+            stream
+                .Read(
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len() as u32,
+                    Some(&mut read),
+                )
+                .ok()?;
+        }
+        if read == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..read as usize]);
+    }
+
+    std::fs::write(&path, &data).map_err(|_| error(E_FAIL))?;
+    Ok(path)
 }
 
 fn register_host_class() {
