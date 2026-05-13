@@ -2445,8 +2445,6 @@ fn load_gltf_file(path: &Path, context: &Context) -> Result<(Scene, f32)> {
         .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or(0.0);
 
-
-
     let axes = Axes::new(context, scene_size * 0.001, scene_size * 0.01);
 
     Ok((
@@ -2931,19 +2929,61 @@ fn render_basic_scene(
     camera: &Camera,
     lights: &[&dyn Light],
 ) {
-    let scene_objects: Vec<&dyn Object> = match &scene.content {
+    render_scene_with_clear(target, scene, camera, lights, (0.15, 0.15, 0.18), true);
+}
+
+fn render_scene_with_clear(
+    target: &RenderTarget<'_>,
+    scene: &Scene,
+    camera: &Camera,
+    lights: &[&dyn Light],
+    clear_color: (f32, f32, f32),
+    include_axes: bool,
+) {
+    let mut scene_objects: Vec<&dyn Object> = match &scene.content {
         SceneContent::Static { models } => models.iter().map(|(_, m)| m as &dyn Object).collect(),
         SceneContent::Animated { model, .. } => model.iter().map(|m| m as &dyn Object).collect(),
     };
+    if include_axes {
+        scene_objects.push(&scene.axes as &dyn Object);
+    }
 
-    target.clear(ClearState::color_and_depth(0.15, 0.15, 0.18, 1.0, 1.0));
-    target.render(
-        camera,
-        scene_objects
-            .into_iter()
-            .chain(std::iter::once(&scene.axes as &dyn Object)),
-        lights,
-    );
+    target.clear(ClearState::color_and_depth(
+        clear_color.0,
+        clear_color.1,
+        clear_color.2,
+        1.0,
+        1.0,
+    ));
+    target.render(camera, scene_objects, lights);
+}
+
+fn apply_thumbnail_clay_style(scene: &mut Scene) {
+    fn apply(mat: &mut PhysicalMaterial) {
+        mat.name = "thumbnail_clay".to_string();
+        mat.albedo = Srgba::new(188, 192, 198, 255);
+        mat.albedo_texture = None;
+        mat.metallic = 0.0;
+        mat.roughness = 0.34;
+        mat.metallic_roughness_texture = None;
+        mat.occlusion_texture = None;
+        mat.normal_texture = None;
+        mat.emissive = Srgba::BLACK;
+        mat.emissive_texture = None;
+    }
+
+    match &mut scene.content {
+        SceneContent::Static { models } => {
+            for (_, model) in models {
+                apply(&mut model.material);
+            }
+        }
+        SceneContent::Animated { model, .. } => {
+            for part in model.iter_mut() {
+                apply(&mut part.material);
+            }
+        }
+    }
 }
 
 fn run_thumbnail(file_path: &Path, out_path: &Path, size: u32) -> Result<()> {
@@ -2955,25 +2995,38 @@ fn run_thumbnail(file_path: &Path, out_path: &Path, size: u32) -> Result<()> {
         .build(&event_loop)?;
     let context = WindowedContext::from_winit_window(&window, SurfaceSettings::default())?;
 
-    let scene = load_shell_scene(&context, file_path, TextureMode::ColorOnly)?;
+    let mut scene = load_shell_scene(&context, file_path, TextureMode::ColorOnly)?;
+    apply_thumbnail_clay_style(&mut scene);
     let viewport = Viewport::new_at_origo(size, size);
     let z_near = (scene.size * 0.01).max(0.1);
     let z_far = scene.size * 100.0;
     let camera = Camera::new_perspective(
         viewport,
-        scene.center + vec3(scene.size * 2.0, scene.size, scene.size * 2.0),
+        scene.center + vec3(scene.size * 1.25, scene.size * 0.65, scene.size * 1.25),
         scene.center,
         vec3(0.0, 1.0, 0.0),
-        degrees(45.0),
+        degrees(35.0),
         z_near,
         z_far,
     );
-    let light0 = DirectionalLight::new(&context, 3.0, Srgba::WHITE, vec3(-1.0, -1.0, -1.0));
-    let light1 = DirectionalLight::new(&context, 1.5, Srgba::WHITE, vec3(1.0, 1.0, 1.0));
-    let ambient = AmbientLight::new(&context, 0.08, Srgba::WHITE);
+    let light0 = DirectionalLight::new(&context, 4.5, Srgba::WHITE, vec3(-0.7, -1.0, -0.45));
+    let light1 = DirectionalLight::new(
+        &context,
+        2.2,
+        Srgba::new(180, 205, 255, 255),
+        vec3(0.9, 0.35, 0.75),
+    );
+    let ambient = AmbientLight::new(&context, 0.03, Srgba::WHITE);
 
     let screen = RenderTarget::screen(&context, size, size);
-    render_basic_scene(&screen, &scene, &camera, &[&light0, &light1, &ambient]);
+    render_scene_with_clear(
+        &screen,
+        &scene,
+        &camera,
+        &[&light0, &light1, &ambient],
+        (0.055, 0.06, 0.07),
+        false,
+    );
     let pixels = screen.read_color::<[u8; 4]>();
     let rgba = pixels.into_iter().flatten().collect::<Vec<_>>();
     let img = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(size, size, rgba)
