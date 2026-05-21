@@ -1,5 +1,6 @@
 /target
 /shell_extension/target
+/dist
 /dcc-exporters/
 *.exe
 *.pdb
