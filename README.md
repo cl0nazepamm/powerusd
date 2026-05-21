@@ -1,17 +1,6 @@
 # PowerUSD
 
-Fast USD asset browser and viewer built in pure Rust.
-
-## Why?
-
-Current 3D asset library software are:
-- Too slow.
-- Bloated.
-- Subscription services.
-- No 3D viewer.
-- No USD support.
-
-I made this so I can stop dealing with .blend or .max files people are selling and build a 3D asset library that runs on a proper format with a lightweight viewing capability. FBX is just as horrible.
+Fast USD asset browser and viewer built in pure Rust with Windows Shell Support.
 
 ## Interface
 
@@ -22,29 +11,8 @@ I made this so I can stop dealing with .blend or .max files people are selling a
 - Thumbnail support (JPG/PNG next to USD files)
 - Fast directory scanning with search
 - Persistent library paths (saved to config)
-
-### 3D Viewer
-- USD/USDC/USDA support
-- GLB support (with animations)
-- Drag & drop file loading
-- Orbit camera controls
-- Z-up to Y-up conversion (3ds Max support)
-- UsdPreviewSurface
-- Multi-material mesh support (GeomSubsets)
-- Multithreaded texture loading/resizing
-
-### PBR & Debug Shading
-- **Load Color Channel** - Diffuse textures only (fast preview)
-- **Load Full PBR** - Full UsdPreviewSurface (diffuse, normal, occlusion, emissive)
-- Click again to unload textures and free memory
-- **Debug Shading** - Toggle individual maps, adjust material values
-- **Environment Maps** - Load HDR/EXR for IBL lighting
-
-### Scene Inspector
-- Hierarchy browser
-- Property inspector
-
-## Thumbnails
+- 
+## Custom Thumbnails are also supported.
 
 Place thumbnail images next to your USD files:
 - `MyModel.usd` → `MyModel.jpg` or `MyModel.png`
