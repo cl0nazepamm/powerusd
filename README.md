@@ -1,6 +1,6 @@
 # PowerUSD
 
-Fast USD asset browser and viewer built in pure Rust. Includes batch exporters for 3ds Max and Blender.
+Fast USD asset browser and viewer built in pure Rust.
 
 ## Why?
 
@@ -10,8 +10,6 @@ Current 3D asset library software are:
 - Subscription services.
 - No 3D viewer.
 - No USD support.
-
-Comes with DCC exporters for batch processing and quick USD conversion so you can build libraries of existing assets fast.
 
 I made this so I can stop dealing with .blend or .max files people are selling and build a 3D asset library that runs on a proper format with a lightweight viewing capability. FBX is just as horrible.
 
@@ -46,24 +44,6 @@ I made this so I can stop dealing with .blend or .max files people are selling a
 - Hierarchy browser
 - Property inspector
 
-## DCC Exporters
-
-Batch USD exporters included in `dcc-exporters/`:
-
-### 3ds Max
-- `powerusd.ms` - Batch exporter with layer/hierarchy/selection set modes
-- USD chasers for UE-compatible UsdPreviewSurface materials
-
-Autodesk's Maxusd supports auto conversion for PhysicalMaterial. But I still recommend using "maxusdpreviewsurface".
-You need the chaser script otherwise you cannot display materials bcuz maxusd exporter is a "nodegraph" mess.
-
-It is not supported by unreal, blender or this viewer.
-
-### Blender
-- `Clone_PowerUSD` addon - One-click batch USD export.
-
-See [dcc-exporters/README.md](dcc-exporters/README.md) for installation.
-
 ## Thumbnails
 
 Place thumbnail images next to your USD files:
@@ -88,8 +68,8 @@ cargo build --release
 
 ## Dependencies
 
-- [openusd](https://github.com/mxpv/openusd) - Pure Rust USD parser
-- [three-d](https://github.com/asny/three-d) - 3D rendering engine
+- [openusd](https://github.com/mxpv/openusd) - Pure Rust USD parser (git submodule under `deps/`)
+- [three-d](https://github.com/asny/three-d) - 3D rendering engine (vendored, modified fork under `deps/three-d`)
 - [egui](https://github.com/emilk/egui) - Immediate mode GUI
 
 ## License

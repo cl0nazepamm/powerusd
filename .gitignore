@@ -7,6 +7,9 @@
 .vscode/
 *.log
 
+# Claude Code local settings
+.claude/settings.local.json
+
 # Python (DCC exporters)
 __pycache__/
 *.py[cod]
