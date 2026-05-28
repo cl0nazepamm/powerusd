@@ -195,7 +195,11 @@ fn generate_id() -> String {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    format!("{}_{}", duration.as_nanos() % 1_000_000_000, rand_u32() % 10000)
+    format!(
+        "{}_{}",
+        duration.as_nanos() % 1_000_000_000,
+        rand_u32() % 10000
+    )
 }
 
 /// Simple random number (no external crate needed)
@@ -788,7 +792,7 @@ impl Stager {
     /// Parse existing USDA file into editable assets
     pub fn parse_stage(&mut self, path: &Path) -> anyhow::Result<()> {
         let content = std::fs::read_to_string(path)?;
-        
+
         // Try to parse with the actual USDA parser
         let mut parser = Parser::new(&content);
         match parser.parse() {
@@ -797,62 +801,70 @@ impl Stager {
                 self.assets.clear();
                 self.base_content = None;
                 self.base_file_path = Some(path.to_path_buf());
-                
+
                 // Extract scene settings from pseudo-root
                 if let Some(root_spec) = specs.get(&sdf::Path::abs_root()) {
                     // Extract defaultPrim
-                    if let Some(sdf::Value::Token(default_prim)) = root_spec.fields.get(FieldKey::DefaultPrim.as_str()) {
+                    if let Some(sdf::Value::Token(default_prim)) =
+                        root_spec.get(FieldKey::DefaultPrim.as_str())
+                    {
                         self.settings.default_prim = default_prim.clone();
                     }
                     // Extract metersPerUnit
-                    if let Some(sdf::Value::Double(mpu)) = root_spec.fields.get("metersPerUnit") {
+                    if let Some(sdf::Value::Double(mpu)) = root_spec.get("metersPerUnit") {
                         self.settings.meters_per_unit = *mpu;
                     }
                     // Extract upAxis
-                    if let Some(sdf::Value::Token(up)) = root_spec.fields.get("upAxis") {
+                    if let Some(sdf::Value::Token(up)) = root_spec.get("upAxis") {
                         self.settings.up_axis = match up.as_str() {
                             "Y" => UpAxis::Y,
                             _ => UpAxis::Z,
                         };
                     }
                     // Extract time codes
-                    if let Some(sdf::Value::Uint64(start)) = root_spec.fields.get("startTimeCode") {
+                    if let Some(sdf::Value::Uint64(start)) = root_spec.get("startTimeCode") {
                         self.settings.start_time_code = *start as f64;
                     }
-                    if let Some(sdf::Value::Uint64(end)) = root_spec.fields.get("endTimeCode") {
+                    if let Some(sdf::Value::Uint64(end)) = root_spec.get("endTimeCode") {
                         self.settings.end_time_code = *end as f64;
                     }
-                    if let Some(sdf::Value::Uint64(fps)) = root_spec.fields.get("framesPerSecond") {
+                    if let Some(sdf::Value::Uint64(fps)) = root_spec.get("framesPerSecond") {
                         self.settings.frames_per_second = *fps as f64;
                     }
-                    if let Some(sdf::Value::Uint64(tcps)) = root_spec.fields.get("timeCodesPerSecond") {
+                    if let Some(sdf::Value::Uint64(tcps)) = root_spec.get("timeCodesPerSecond") {
                         self.settings.time_codes_per_second = *tcps as f64;
                     }
                 }
-                
+
                 // Convert prims to StagerAssets - find root prims first
                 let mut root_prims = Vec::new();
                 for (prim_path, spec) in &specs {
                     if spec.ty == sdf::SpecType::Prim {
                         // Root prim = path has exactly one component after /
                         let path_str = format!("{}", prim_path);
-                        if path_str.starts_with('/') && !path_str[1..].contains('/') && path_str.len() > 1 {
+                        if path_str.starts_with('/')
+                            && !path_str[1..].contains('/')
+                            && path_str.len() > 1
+                        {
                             root_prims.push((prim_path.clone(), spec));
                         }
                     }
                 }
-                
+
                 // Convert each root prim recursively
                 for (prim_path, spec) in root_prims {
                     if let Some(asset) = self.spec_to_asset(&prim_path, spec, &specs) {
                         self.assets.push(asset);
                     }
                 }
-                
+
                 self.clear_history();
                 let count = self.assets.len();
-                self.set_status(&format!("Parsed: {} ({} prims)", 
-                    path.file_name().unwrap_or_default().to_string_lossy(), count));
+                self.set_status(&format!(
+                    "Parsed: {} ({} prims)",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    count
+                ));
                 Ok(())
             }
             Err(e) => {
@@ -867,50 +879,51 @@ impl Stager {
             }
         }
     }
-    
+
     /// Convert a parsed sdf::Spec to a StagerAsset
     fn spec_to_asset(
-        &self, 
-        prim_path: &sdf::Path, 
-        spec: &sdf::Spec, 
-        all_specs: &HashMap<sdf::Path, sdf::Spec>
+        &self,
+        prim_path: &sdf::Path,
+        spec: &sdf::Spec,
+        all_specs: &HashMap<sdf::Path, sdf::Spec>,
     ) -> Option<StagerAsset> {
         // Get the prim name from the path
         let path_str = format!("{}", prim_path);
         let name = path_str.rsplit('/').next().unwrap_or("Unknown").to_string();
-        
+
         let mut asset = StagerAsset {
             id: generate_id(),
             name,
             ..Default::default()
         };
-        
+
         // Extract specifier
-        if let Some(sdf::Value::Specifier(specifier)) = spec.fields.get(FieldKey::Specifier.as_str()) {
+        if let Some(sdf::Value::Specifier(specifier)) = spec.get(FieldKey::Specifier.as_str()) {
             asset.specifier = match specifier {
                 sdf::Specifier::Def => Specifier::Def,
                 sdf::Specifier::Over => Specifier::Over,
                 sdf::Specifier::Class => Specifier::Class,
             };
         }
-        
+
         // Extract prim type
-        if let Some(sdf::Value::Token(type_name)) = spec.fields.get(FieldKey::TypeName.as_str()) {
+        if let Some(sdf::Value::Token(type_name)) = spec.get(FieldKey::TypeName.as_str()) {
             asset.prim_type = Some(type_name.clone());
         }
-        
+
         // Extract kind
-        if let Some(sdf::Value::Token(kind)) = spec.fields.get(FieldKey::Kind.as_str()) {
+        if let Some(sdf::Value::Token(kind)) = spec.get(FieldKey::Kind.as_str()) {
             asset.kind = UsdKind::from_str(kind);
         }
-        
+
         // Extract instanceable flag
-        if let Some(sdf::Value::Bool(instanceable)) = spec.fields.get(FieldKey::Instanceable.as_str()) {
+        if let Some(sdf::Value::Bool(instanceable)) = spec.get(FieldKey::Instanceable.as_str()) {
             asset.instanceable = *instanceable;
         }
-        
+
         // Extract references
-        if let Some(sdf::Value::ReferenceListOp(ref_list)) = spec.fields.get(FieldKey::References.as_str()) {
+        if let Some(sdf::Value::ReferenceListOp(ref_list)) = spec.get(FieldKey::References.as_str())
+        {
             // Get prepended references (most common)
             if let Some(first_ref) = ref_list.prepended_items.first() {
                 if !first_ref.asset_path.is_empty() {
@@ -934,49 +947,52 @@ impl Stager {
                 }
             }
         }
-        
+
         // Extract transforms from properties
         self.extract_transforms_from_specs(prim_path, all_specs, &mut asset);
-        
+
         // Find and add children
-        if let Some(sdf::Value::TokenVec(children)) = spec.fields.get("primChildren") {
+        if let Some(sdf::Value::TokenVec(children)) = spec.get("primChildren") {
             for child_name in children {
                 let child_path = sdf::Path::new(&format!("{}/{}", path_str, child_name)).ok()?;
                 if let Some(child_spec) = all_specs.get(&child_path) {
-                    if let Some(child_asset) = self.spec_to_asset(&child_path, child_spec, all_specs) {
+                    if let Some(child_asset) =
+                        self.spec_to_asset(&child_path, child_spec, all_specs)
+                    {
                         asset.children.push(child_asset);
                     }
                 }
             }
         }
-        
+
         Some(asset)
     }
-    
+
     /// Extract transform values from property specs
     fn extract_transforms_from_specs(
         &self,
         prim_path: &sdf::Path,
         all_specs: &HashMap<sdf::Path, sdf::Spec>,
-        asset: &mut StagerAsset
+        asset: &mut StagerAsset,
     ) {
         let path_str = format!("{}", prim_path);
-        
+
         // Try to find xformOpOrder first
         let xform_order_path = sdf::Path::new(&format!("{}.xformOpOrder", path_str)).ok();
         if let Some(order_path) = xform_order_path {
             if let Some(order_spec) = all_specs.get(&order_path) {
-                if let Some(sdf::Value::TokenVec(ops)) = order_spec.fields.get(FieldKey::Default.as_str()) {
+                if let Some(sdf::Value::TokenVec(ops)) = order_spec.get(FieldKey::Default.as_str())
+                {
                     asset.xform_op_order = Some(ops.clone());
                 }
             }
         }
-        
+
         // Extract translate (double3)
         let translate_path = sdf::Path::new(&format!("{}.xformOp:translate", path_str)).ok();
         if let Some(t_path) = translate_path {
             if let Some(t_spec) = all_specs.get(&t_path) {
-                if let Some(sdf::Value::Vec3d(v)) = t_spec.fields.get(FieldKey::Default.as_str()) {
+                if let Some(sdf::Value::Vec3d(v)) = t_spec.get(FieldKey::Default.as_str()) {
                     if v.len() >= 3 {
                         asset.position = Vec3::new(v[0], v[1], v[2]);
                         asset.has_explicit_transforms = true;
@@ -984,12 +1000,12 @@ impl Stager {
                 }
             }
         }
-        
+
         // Extract rotate (as euler angles - float3)
         let rotate_path = sdf::Path::new(&format!("{}.xformOp:rotateXYZ", path_str)).ok();
         if let Some(r_path) = rotate_path {
             if let Some(r_spec) = all_specs.get(&r_path) {
-                if let Some(sdf::Value::Vec3f(v)) = r_spec.fields.get(FieldKey::Default.as_str()) {
+                if let Some(sdf::Value::Vec3f(v)) = r_spec.get(FieldKey::Default.as_str()) {
                     if v.len() >= 3 {
                         asset.rotation = Vec3::new(v[0] as f64, v[1] as f64, v[2] as f64);
                         asset.has_explicit_transforms = true;
@@ -997,12 +1013,12 @@ impl Stager {
                 }
             }
         }
-        
+
         // Extract scale (float3)
         let scale_path = sdf::Path::new(&format!("{}.xformOp:scale", path_str)).ok();
         if let Some(s_path) = scale_path {
             if let Some(s_spec) = all_specs.get(&s_path) {
-                if let Some(sdf::Value::Vec3f(v)) = s_spec.fields.get(FieldKey::Default.as_str()) {
+                if let Some(sdf::Value::Vec3f(v)) = s_spec.get(FieldKey::Default.as_str()) {
                     if v.len() >= 3 {
                         asset.scale = Vec3::new(v[0] as f64, v[1] as f64, v[2] as f64);
                         asset.has_explicit_transforms = true;
@@ -1010,12 +1026,12 @@ impl Stager {
                 }
             }
         }
-        
+
         // Extract full transform matrix if present (matrix4d = 16 doubles)
         let matrix_path = sdf::Path::new(&format!("{}.xformOp:transform", path_str)).ok();
         if let Some(m_path) = matrix_path {
             if let Some(m_spec) = all_specs.get(&m_path) {
-                if let Some(sdf::Value::Matrix4d(v)) = m_spec.fields.get(FieldKey::Default.as_str()) {
+                if let Some(sdf::Value::Matrix4d(v)) = m_spec.get(FieldKey::Default.as_str()) {
                     if v.len() >= 16 {
                         let mut matrix = [0.0f64; 16];
                         matrix.copy_from_slice(&v[0..16]);
@@ -1037,7 +1053,10 @@ impl Stager {
         lines.push("#usda 1.0".to_string());
         lines.push("(".to_string());
         if !self.settings.default_prim.is_empty() {
-            lines.push(format!("    defaultPrim = \"{}\"", self.settings.default_prim));
+            lines.push(format!(
+                "    defaultPrim = \"{}\"",
+                self.settings.default_prim
+            ));
         }
         lines.push(format!(
             "    metersPerUnit = {}",
@@ -1065,19 +1084,16 @@ impl Stager {
         let path_map = self.build_path_map();
 
         // Root prim wrapper if needed
-        let root_indent = if self.settings.create_root_prim && !self.settings.default_prim.is_empty()
-        {
-            lines.push(format!(
-                "def Xform \"{}\" (",
-                self.settings.default_prim
-            ));
-            lines.push("    kind = \"assembly\"".to_string());
-            lines.push(")".to_string());
-            lines.push("{".to_string());
-            "    "
-        } else {
-            ""
-        };
+        let root_indent =
+            if self.settings.create_root_prim && !self.settings.default_prim.is_empty() {
+                lines.push(format!("def Xform \"{}\" (", self.settings.default_prim));
+                lines.push("    kind = \"assembly\"".to_string());
+                lines.push(")".to_string());
+                lines.push("{".to_string());
+                "    "
+            } else {
+                ""
+            };
 
         // Generate asset blocks
         for asset in &self.assets {
@@ -1091,8 +1107,8 @@ impl Stager {
 
         // If we have base content, inject into it
         if let Some(ref base) = self.base_content {
-            let asset_block = lines[lines.iter().position(|l| l.is_empty()).unwrap_or(0)..]
-                .join("\n");
+            let asset_block =
+                lines[lines.iter().position(|l| l.is_empty()).unwrap_or(0)..].join("\n");
 
             if self.settings.create_root_prim {
                 // Inject before last closing brace
@@ -1194,7 +1210,10 @@ impl Stager {
                                 .cloned()
                                 .unwrap_or_else(|| format!("/{}", target))
                         };
-                        lines.push(format!("{}{} references = <{}>", meta_indent, ref_op, target_path));
+                        lines.push(format!(
+                            "{}{} references = <{}>",
+                            meta_indent, ref_op, target_path
+                        ));
                     }
                 }
                 ReferenceType::File => {
@@ -1208,7 +1227,10 @@ impl Stager {
                         ref_path = format!("{}/{}", clean_global, file_name);
                     }
                     if !ref_path.is_empty() {
-                        lines.push(format!("{}{} references = @{}@", meta_indent, ref_op, ref_path));
+                        lines.push(format!(
+                            "{}{} references = @{}@",
+                            meta_indent, ref_op, ref_path
+                        ));
                     }
                 }
             }
@@ -1355,13 +1377,22 @@ impl Stager {
 
                 // Tab bar
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(self.active_tab == StagerTab::Assets, "📦 Assets").clicked() {
+                    if ui
+                        .selectable_label(self.active_tab == StagerTab::Assets, "📦 Assets")
+                        .clicked()
+                    {
                         self.active_tab = StagerTab::Assets;
                     }
-                    if ui.selectable_label(self.active_tab == StagerTab::Preview, "📄 Preview").clicked() {
+                    if ui
+                        .selectable_label(self.active_tab == StagerTab::Preview, "📄 Preview")
+                        .clicked()
+                    {
                         self.active_tab = StagerTab::Preview;
                     }
-                    if ui.selectable_label(self.active_tab == StagerTab::Settings, "⚙ Settings").clicked() {
+                    if ui
+                        .selectable_label(self.active_tab == StagerTab::Settings, "⚙ Settings")
+                        .clicked()
+                    {
                         self.active_tab = StagerTab::Settings;
                     }
                 });
@@ -1393,7 +1424,11 @@ impl Stager {
     fn render_compact_toolbar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             // New stage
-            if ui.button("🗋").on_hover_text("New Stage (clear all)").clicked() {
+            if ui
+                .button("🗋")
+                .on_hover_text("New Stage (clear all)")
+                .clicked()
+            {
                 self.save_history();
                 self.assets.clear();
                 self.base_content = None;
@@ -1402,7 +1437,11 @@ impl Stager {
             }
 
             // Open/Parse existing stage
-            if ui.button("📂").on_hover_text("Open Stage (parse & edit)").clicked() {
+            if ui
+                .button("📂")
+                .on_hover_text("Open Stage (parse & edit)")
+                .clicked()
+            {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("USD", &["usda", "usd", "usdc"])
                     .pick_file()
@@ -1416,7 +1455,11 @@ impl Stager {
             ui.separator();
 
             // Add asset reference(s) - supports multi-selection
-            if ui.button("➕").on_hover_text("Add Asset Reference(s)").clicked() {
+            if ui
+                .button("➕")
+                .on_hover_text("Add Asset Reference(s)")
+                .clicked()
+            {
                 if let Some(paths) = rfd::FileDialog::new()
                     .add_filter("USD", &["usda", "usd", "usdc"])
                     .pick_files()
@@ -1474,7 +1517,10 @@ impl Stager {
                     ui.label(RichText::new("Mode: Standalone").color(Color32::LIGHT_GREEN));
                 }
                 if let Some(ref path) = self.base_file_path {
-                    ui.label(format!("({})", path.file_name().unwrap_or_default().to_string_lossy()));
+                    ui.label(format!(
+                        "({})",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
                 }
             });
         }
@@ -1485,9 +1531,11 @@ impl Stager {
         ui.horizontal(|ui| {
             ui.label(RichText::new("📦 Assets").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.search_query)
-                    .hint_text("🔍 Search...")
-                    .desired_width(120.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search_query)
+                        .hint_text("🔍 Search...")
+                        .desired_width(120.0),
+                );
             });
         });
 
@@ -1516,13 +1564,25 @@ impl Stager {
         // Quick actions
         ui.horizontal(|ui| {
             let has_selection = !self.get_selected_ids().is_empty();
-            if ui.add_enabled(has_selection, egui::Button::new("🗑")).on_hover_text("Delete").clicked() {
+            if ui
+                .add_enabled(has_selection, egui::Button::new("🗑"))
+                .on_hover_text("Delete")
+                .clicked()
+            {
                 self.delete_selected();
             }
-            if ui.add_enabled(has_selection, egui::Button::new("📋")).on_hover_text("Duplicate").clicked() {
+            if ui
+                .add_enabled(has_selection, egui::Button::new("📋"))
+                .on_hover_text("Duplicate")
+                .clicked()
+            {
                 self.duplicate_selected();
             }
-            if ui.add_enabled(has_selection, egui::Button::new("📁")).on_hover_text("Wrap in Xform (Ctrl+G)").clicked() {
+            if ui
+                .add_enabled(has_selection, egui::Button::new("📁"))
+                .on_hover_text("Wrap in Xform (Ctrl+G)")
+                .clicked()
+            {
                 self.wrap_selected_in_xform();
             }
             ui.separator();
@@ -1559,7 +1619,10 @@ impl Stager {
                                 AssemblyPreset::Max3dsCm,
                                 AssemblyPreset::Custom,
                             ] {
-                                if ui.selectable_label(self.preset == preset, preset.label()).clicked() {
+                                if ui
+                                    .selectable_label(self.preset == preset, preset.label())
+                                    .clicked()
+                                {
                                     self.preset = preset;
                                     preset.apply(&mut self.settings);
                                 }
@@ -1581,10 +1644,16 @@ impl Stager {
                     egui::ComboBox::from_id_salt("upaxis")
                         .selected_text(format!("{}", self.settings.up_axis))
                         .show_ui(ui, |ui| {
-                            if ui.selectable_label(self.settings.up_axis == UpAxis::Y, "Y").clicked() {
+                            if ui
+                                .selectable_label(self.settings.up_axis == UpAxis::Y, "Y")
+                                .clicked()
+                            {
                                 self.settings.up_axis = UpAxis::Y;
                             }
-                            if ui.selectable_label(self.settings.up_axis == UpAxis::Z, "Z").clicked() {
+                            if ui
+                                .selectable_label(self.settings.up_axis == UpAxis::Z, "Z")
+                                .clicked()
+                            {
                                 self.settings.up_axis = UpAxis::Z;
                             }
                         });
@@ -1612,7 +1681,10 @@ impl Stager {
                 ui.horizontal(|ui| {
                     ui.label("Start:");
                     let mut start = self.settings.start_time_code as f32;
-                    if ui.add(egui::DragValue::new(&mut start).speed(1.0)).changed() {
+                    if ui
+                        .add(egui::DragValue::new(&mut start).speed(1.0))
+                        .changed()
+                    {
                         self.settings.start_time_code = start as f64;
                     }
                     ui.label("End:");
@@ -1650,20 +1722,21 @@ impl Stager {
                             let _ = self.load_base_file(&path);
                         }
                     }
-                    if self.base_content.is_some() {
-                        if ui.button("Clear Base").clicked() {
-                            self.base_content = None;
-                            self.set_status("Base file cleared - standalone mode");
-                        }
+                    if self.base_content.is_some() && ui.button("Clear Base").clicked() {
+                        self.base_content = None;
+                        self.set_status("Base file cleared - standalone mode");
                     }
                 });
 
                 if let Some(ref path) = self.base_file_path {
                     if self.base_content.is_some() {
-                        ui.label(RichText::new(format!(
-                            "Base: {}",
-                            path.file_name().unwrap_or_default().to_string_lossy()
-                        )).color(Color32::LIGHT_BLUE));
+                        ui.label(
+                            RichText::new(format!(
+                                "Base: {}",
+                                path.file_name().unwrap_or_default().to_string_lossy()
+                            ))
+                            .color(Color32::LIGHT_BLUE),
+                        );
                     }
                 }
             });
@@ -1757,15 +1830,14 @@ impl Stager {
         let available_width = ui.available_width();
 
         // Use available space for the preview with scrolling
-        egui::ScrollArea::vertical()
-            .show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut preview.as_str())
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(available_width)
-                        .interactive(false),
-                );
-            });
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut preview.as_str())
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(available_width)
+                    .interactive(false),
+            );
+        });
     }
 
     fn render_properties_content(&mut self, ui: &mut Ui) {
@@ -1788,7 +1860,7 @@ impl Stager {
             let mut pending_instanceable: Option<bool> = None;
             let mut start_rename = false;
             let mut cancel_rename = false;
-            
+
             // Flags to save history
             let mut should_save_history = false;
 
@@ -1854,11 +1926,18 @@ impl Stager {
                     let r1 = ui.add(egui::DragValue::new(&mut pos[0]).speed(0.1).prefix("X: "));
                     let r2 = ui.add(egui::DragValue::new(&mut pos[1]).speed(0.1).prefix("Y: "));
                     let r3 = ui.add(egui::DragValue::new(&mut pos[2]).speed(0.1).prefix("Z: "));
-                    
+
                     if r1.changed() || r2.changed() || r3.changed() {
-                        pending_position = Some(Vec3::new(pos[0] as f64, pos[1] as f64, pos[2] as f64));
+                        pending_position =
+                            Some(Vec3::new(pos[0] as f64, pos[1] as f64, pos[2] as f64));
                     }
-                    if r1.drag_stopped() || r2.drag_stopped() || r3.drag_stopped() || r1.lost_focus() || r2.lost_focus() || r3.lost_focus() {
+                    if r1.drag_stopped()
+                        || r2.drag_stopped()
+                        || r3.drag_stopped()
+                        || r1.lost_focus()
+                        || r2.lost_focus()
+                        || r3.lost_focus()
+                    {
                         should_save_history = true;
                     }
                 });
@@ -1874,11 +1953,18 @@ impl Stager {
                     let r1 = ui.add(egui::DragValue::new(&mut rot[0]).speed(1.0).prefix("X: "));
                     let r2 = ui.add(egui::DragValue::new(&mut rot[1]).speed(1.0).prefix("Y: "));
                     let r3 = ui.add(egui::DragValue::new(&mut rot[2]).speed(1.0).prefix("Z: "));
-                    
+
                     if r1.changed() || r2.changed() || r3.changed() {
-                        pending_rotation = Some(Vec3::new(rot[0] as f64, rot[1] as f64, rot[2] as f64));
+                        pending_rotation =
+                            Some(Vec3::new(rot[0] as f64, rot[1] as f64, rot[2] as f64));
                     }
-                    if r1.drag_stopped() || r2.drag_stopped() || r3.drag_stopped() || r1.lost_focus() || r2.lost_focus() || r3.lost_focus() {
+                    if r1.drag_stopped()
+                        || r2.drag_stopped()
+                        || r3.drag_stopped()
+                        || r1.lost_focus()
+                        || r2.lost_focus()
+                        || r3.lost_focus()
+                    {
                         should_save_history = true;
                     }
                 });
@@ -1894,11 +1980,18 @@ impl Stager {
                     let r1 = ui.add(egui::DragValue::new(&mut scl[0]).speed(0.01).prefix("X: "));
                     let r2 = ui.add(egui::DragValue::new(&mut scl[1]).speed(0.01).prefix("Y: "));
                     let r3 = ui.add(egui::DragValue::new(&mut scl[2]).speed(0.01).prefix("Z: "));
-                    
+
                     if r1.changed() || r2.changed() || r3.changed() {
-                        pending_scale = Some(Vec3::new(scl[0] as f64, scl[1] as f64, scl[2] as f64));
+                        pending_scale =
+                            Some(Vec3::new(scl[0] as f64, scl[1] as f64, scl[2] as f64));
                     }
-                    if r1.drag_stopped() || r2.drag_stopped() || r3.drag_stopped() || r1.lost_focus() || r2.lost_focus() || r3.lost_focus() {
+                    if r1.drag_stopped()
+                        || r2.drag_stopped()
+                        || r3.drag_stopped()
+                        || r1.lost_focus()
+                        || r2.lost_focus()
+                        || r3.lost_focus()
+                    {
                         should_save_history = true;
                     }
                 });
@@ -1964,7 +2057,9 @@ impl Stager {
 
             // Update transform without saving history (for smooth dragging)
             if let Some(pos) = pending_position {
-                if should_save_history { self.save_history(); }
+                if should_save_history {
+                    self.save_history();
+                }
                 if let Some(a) = self.find_asset_mut(&id) {
                     a.position = pos;
                     if a.use_matrix {
@@ -1974,7 +2069,9 @@ impl Stager {
             }
 
             if let Some(rot) = pending_rotation {
-                if should_save_history { self.save_history(); }
+                if should_save_history {
+                    self.save_history();
+                }
                 if let Some(a) = self.find_asset_mut(&id) {
                     a.rotation = rot;
                     if a.use_matrix {
@@ -1984,7 +2081,9 @@ impl Stager {
             }
 
             if let Some(scl) = pending_scale {
-                if should_save_history { self.save_history(); }
+                if should_save_history {
+                    self.save_history();
+                }
                 if let Some(a) = self.find_asset_mut(&id) {
                     a.scale = scl;
                     if a.use_matrix {
@@ -2039,9 +2138,7 @@ fn format_number(n: f64) -> String {
     } else {
         let s = format!("{}", n);
         if s.contains('.') {
-            s.trim_end_matches('0')
-                .trim_end_matches('.')
-                .to_string()
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
                 + if !s.contains('.') || s.ends_with('.') {
                     ".0"
                 } else {

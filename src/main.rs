@@ -214,7 +214,7 @@ impl ComposedData {
                         if let Some(dp) = default_prim {
                             dp
                         } else {
-                            let ref_name = prim_path_str.split('/').last().unwrap_or("");
+                            let ref_name = prim_path_str.split('/').next_back().unwrap_or("");
                             let same_name_prim = sdf::path(format!("/{}", ref_name)).ok();
 
                             if let Some(snp) = same_name_prim.filter(|p| layer.has_spec(p)) {
@@ -385,7 +385,7 @@ impl sdf::AbstractData for ComposedData {
         None
     }
 
-    fn get(&self, path: &sdf::Path, field: &str) -> Result<Cow<'_, sdf::Value>> {
+    fn try_get(&self, path: &sdf::Path, field: &str) -> Result<Option<Cow<'_, sdf::Value>>> {
         // For primChildren, we need to merge from ALL layers (primary + referenced)
         // This must be handled specially before the early return for primary layer
         if field == "primChildren" {
@@ -422,14 +422,14 @@ impl sdf::AbstractData for ComposedData {
             }
 
             if !children.is_empty() {
-                return Ok(Cow::Owned(sdf::Value::TokenVec(children)));
+                return Ok(Some(Cow::Owned(sdf::Value::TokenVec(children))));
             }
             // Fall through to check other sources if no children found
         }
 
         // For non-primChildren fields, primary layer wins (local opinions)
         if self.primary.has_field(path, field) {
-            return self.primary.get(path, field);
+            return self.primary.get(path, field).map(Some);
         }
 
         // Check referenced layers for other fields
@@ -439,14 +439,16 @@ impl sdf::AbstractData for ComposedData {
                     if let Some(translated) = self.translate_path(path, &ref_base_path, ref_target)
                     {
                         if self.reference_layers[*layer_idx].has_field(&translated, field) {
-                            return self.reference_layers[*layer_idx].get(&translated, field);
+                            return self.reference_layers[*layer_idx]
+                                .get(&translated, field)
+                                .map(Some);
                         }
                     }
                 }
             }
         }
 
-        bail!("No field found for path '{path}' and field '{field}'")
+        Ok(None)
     }
 
     fn list(&self, path: &sdf::Path) -> Option<Vec<String>> {
@@ -482,6 +484,32 @@ impl sdf::AbstractData for ComposedData {
         } else {
             Some(fields)
         }
+    }
+
+    fn paths(&self) -> Vec<sdf::Path> {
+        let mut paths = self.primary.paths();
+
+        // Surface each referenced layer's authored paths in the composed
+        // namespace. Re-rooting from the reference target back under the
+        // referencing base is the inverse of `translate_path`, so we reuse it
+        // with `base` and `target` swapped.
+        for (ref_base, refs) in &self.reference_map {
+            if let Ok(ref_base_path) = sdf::path(ref_base.clone()) {
+                for (ref_target, layer_idx) in refs {
+                    for referenced in self.reference_layers[*layer_idx].paths() {
+                        if let Some(composed) =
+                            self.translate_path(&referenced, ref_target, &ref_base_path)
+                        {
+                            paths.push(composed);
+                        }
+                    }
+                }
+            }
+        }
+
+        paths.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        paths.dedup();
+        paths
     }
 }
 
@@ -1813,7 +1841,7 @@ fn extract_meshes(data: &mut dyn AbstractData, root: &sdf::Path) -> Result<Vec<U
 
         // Try to extract mesh from current prim (except root which is usually just a container)
         if !path.as_str().eq("/") {
-            let name = path.as_str().split('/').last().unwrap_or("mesh");
+            let name = path.as_str().split('/').next_back().unwrap_or("mesh");
             let extracted = try_extract_meshes(data, &path, name, world_transform);
             meshes.extend(extracted);
         }
