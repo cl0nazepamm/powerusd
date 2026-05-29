@@ -821,18 +821,20 @@ impl Stager {
                             _ => UpAxis::Z,
                         };
                     }
-                    // Extract time codes
-                    if let Some(sdf::Value::Uint64(start)) = root_spec.get("startTimeCode") {
-                        self.settings.start_time_code = *start as f64;
+                    // Extract time codes. USD authors these as doubles (the
+                    // text parser yields `Double` even for integer literals
+                    // like `framesPerSecond = 60`), so match that variant.
+                    if let Some(sdf::Value::Double(start)) = root_spec.get("startTimeCode") {
+                        self.settings.start_time_code = *start;
                     }
-                    if let Some(sdf::Value::Uint64(end)) = root_spec.get("endTimeCode") {
-                        self.settings.end_time_code = *end as f64;
+                    if let Some(sdf::Value::Double(end)) = root_spec.get("endTimeCode") {
+                        self.settings.end_time_code = *end;
                     }
-                    if let Some(sdf::Value::Uint64(fps)) = root_spec.get("framesPerSecond") {
-                        self.settings.frames_per_second = *fps as f64;
+                    if let Some(sdf::Value::Double(fps)) = root_spec.get("framesPerSecond") {
+                        self.settings.frames_per_second = *fps;
                     }
-                    if let Some(sdf::Value::Uint64(tcps)) = root_spec.get("timeCodesPerSecond") {
-                        self.settings.time_codes_per_second = *tcps as f64;
+                    if let Some(sdf::Value::Double(tcps)) = root_spec.get("timeCodesPerSecond") {
+                        self.settings.time_codes_per_second = *tcps;
                     }
                 }
 
